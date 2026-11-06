@@ -2,6 +2,7 @@ import sys
 import os
 import math
 import json
+import time
 import hashlib
 import tempfile
 import threading
@@ -123,76 +124,182 @@ def project_bearing_to_fov(bearing_deg, center_az_deg, hfov_deg, projection="rec
     return in_fov, round(delta_deg, 2), round(x_frac, 3)
 
 
-def calibrate_azimuth(hfov_deg, anchors, projection="rectilinear"):
+def project_coordinate(lat1, lon1, bearing_deg, dist_km):
+    """
+    Spherical forward projection from (lat1, lon1) along bearing_deg (degrees clockwise from North)
+    for dist_km (kilometers). Returns (lat2, lon2).
+    """
+    R_km = 6371.0
+    ang_dist = float(dist_km) / R_km
+    phi1 = math.radians(float(lat1))
+    lam1 = math.radians(float(lon1))
+    theta = math.radians(float(bearing_deg) % 360.0)
+
+    sin_phi2 = math.sin(phi1) * math.cos(ang_dist) + math.cos(phi1) * math.sin(ang_dist) * math.cos(theta)
+    sin_phi2 = max(-1.0, min(1.0, sin_phi2))
+    phi2 = math.asin(sin_phi2)
+    y = math.sin(theta) * math.sin(ang_dist) * math.cos(phi1)
+    x = math.cos(ang_dist) - math.sin(phi1) * math.sin(phi2)
+    lam2 = lam1 + math.atan2(y, x)
+    lat2 = math.degrees(phi2)
+    lon2 = ((math.degrees(lam2) + 540.0) % 360.0) - 180.0
+    return round(lat2, 6), round(lon2, 6)
+
+
+def calibrate_azimuth(
+    hfov_deg,
+    anchors=None,
+    projection="rectilinear",
+    center_az=None,
+    x_fracs=None,
+    project_bearings=None,
+):
     """
     Inverts the horizontal FOV projection formula for one or more anchor landmarks
     (each given as 'bearing_deg:x_fraction', 'Name:bearing_deg:x_fraction', or (bearing_deg, x_fraction))
-    to solve for camera center_azimuth_deg, left_edge_deg, and right_edge_deg.
+    to solve for camera center_azimuth_deg, left_edge_deg, and right_edge_deg, OR accepts an explicit
+    center_az and performs forward x_frac -> bearing lookups and/or multi-bearing -> x_frac projections.
     """
     proj_mode = (projection or "rectilinear").lower()
     if proj_mode == "auto":
         proj_mode = "cylindrical" if hfov_deg > 100.0 else "rectilinear"
 
     parsed_anchors = []
-    for raw in anchors:
-        label = None
-        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-            b_deg, x_frac = float(raw[0]), float(raw[1])
-        elif isinstance(raw, dict):
-            b_deg = float(raw["bearing_deg"])
-            x_frac = float(raw["x_fraction"])
-            label = raw.get("name")
-        else:
-            raw_s = str(raw)
-            sep = ":" if ":" in raw_s else ","
-            parts = [p.strip() for p in raw_s.split(sep)]
-            if len(parts) == 2:
-                b_deg, x_frac = float(parts[0]), float(parts[1])
-            elif len(parts) >= 3:
-                label = ":".join(parts[:-2])
-                b_deg, x_frac = float(parts[-2]), float(parts[-1])
+    if anchors:
+        for raw in anchors:
+            label = None
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                b_deg, x_frac = float(raw[0]), float(raw[1])
+            elif isinstance(raw, dict):
+                b_deg = float(raw["bearing_deg"])
+                x_frac = float(raw["x_fraction"])
+                label = raw.get("name")
             else:
-                raise ValueError(f"Invalid anchor specification '{raw}'. Expected 'bearing_deg:x_fraction'.")
+                raw_s = str(raw)
+                sep = ":" if ":" in raw_s else ","
+                parts = [p.strip() for p in raw_s.split(sep)]
+                if len(parts) == 2:
+                    b_deg, x_frac = float(parts[0]), float(parts[1])
+                elif len(parts) >= 3:
+                    label = ":".join(parts[:-2])
+                    b_deg, x_frac = float(parts[-2]), float(parts[-1])
+                else:
+                    raise ValueError(f"Invalid anchor specification '{raw}'. Expected 'bearing_deg:x_fraction'.")
 
-        if proj_mode == "cylindrical" or hfov_deg >= 175.0:
-            delta_deg = (x_frac - 0.5) * hfov_deg
-        else:
-            tan_half = math.tan(math.radians(hfov_deg / 2.0))
-            delta_deg = math.degrees(math.atan((x_frac - 0.5) * 2.0 * tan_half))
+            if proj_mode == "cylindrical" or hfov_deg >= 175.0:
+                delta_deg = (x_frac - 0.5) * hfov_deg
+            else:
+                tan_half = math.tan(math.radians(hfov_deg / 2.0))
+                delta_deg = math.degrees(math.atan((x_frac - 0.5) * 2.0 * tan_half))
 
-        implied_center = (b_deg - delta_deg) % 360.0
-        entry = {
-            "landmark_bearing_deg": round(b_deg, 2),
-            "observed_x_fraction": round(x_frac, 3),
-            "offset_from_center_deg": round(delta_deg, 2),
-            "implied_center_azimuth_deg": round(implied_center, 2),
-        }
-        if label:
-            entry["name"] = label
-        parsed_anchors.append(entry)
+            implied_center = (b_deg - delta_deg) % 360.0
+            entry = {
+                "landmark_bearing_deg": round(b_deg, 2),
+                "observed_x_fraction": round(x_frac, 3),
+                "offset_from_center_deg": round(delta_deg, 2),
+                "implied_center_azimuth_deg": round(implied_center, 2),
+            }
+            if label:
+                entry["name"] = label
+            parsed_anchors.append(entry)
 
-    if not parsed_anchors:
-        raise ValueError("At least one anchor is required for calibrate_azimuth")
+    if parsed_anchors:
+        # Circular mean of implied center azimuths
+        sin_sum = sum(math.sin(math.radians(a["implied_center_azimuth_deg"])) for a in parsed_anchors)
+        cos_sum = sum(math.cos(math.radians(a["implied_center_azimuth_deg"])) for a in parsed_anchors)
+        solved_center_az = (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+        for a in parsed_anchors:
+            a["residual_deg"] = round(angular_diff_signed(a["implied_center_azimuth_deg"], solved_center_az), 2)
+    elif center_az is not None:
+        solved_center_az = float(center_az) % 360.0
+    else:
+        raise ValueError("At least one of --anchor or --center-az is required for calibrate-azimuth")
 
-    # Circular mean of implied center azimuths
-    sin_sum = sum(math.sin(math.radians(a["implied_center_azimuth_deg"])) for a in parsed_anchors)
-    cos_sum = sum(math.cos(math.radians(a["implied_center_azimuth_deg"])) for a in parsed_anchors)
-    center_az = (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
-    left_edge = (center_az - hfov_deg / 2.0) % 360.0
-    right_edge = (center_az + hfov_deg / 2.0) % 360.0
+    left_edge = (solved_center_az - hfov_deg / 2.0) % 360.0
+    right_edge = (solved_center_az + hfov_deg / 2.0) % 360.0
 
-    for a in parsed_anchors:
-        a["residual_deg"] = round(angular_diff_signed(a["implied_center_azimuth_deg"], center_az), 2)
-
-    return {
+    out = {
         "projection": proj_mode,
         "hfov_deg": round(hfov_deg, 1),
-        "center_azimuth_deg": round(center_az, 1),
-        "center_cardinal": get_compass_cardinal(center_az),
+        "center_azimuth_deg": round(solved_center_az, 1),
+        "center_cardinal": get_compass_cardinal(solved_center_az),
         "left_edge_deg": round(left_edge, 1),
         "right_edge_deg": round(right_edge, 1),
         "anchors": parsed_anchors,
     }
+
+    if x_fracs:
+        raw_x_tokens = []
+        if isinstance(x_fracs, (list, tuple)):
+            for item in x_fracs:
+                raw_x_tokens.extend(p.strip() for p in str(item).split(",") if p.strip())
+        else:
+            raw_x_tokens.extend(p.strip() for p in str(x_fracs).split(",") if p.strip())
+
+        x_proj_list = []
+        for tok in raw_x_tokens:
+            x_label = None
+            if ":" in tok:
+                x_label_part, x_val_part = tok.rsplit(":", 1)
+                x_label = x_label_part.strip()
+                x_f = float(x_val_part.strip())
+            else:
+                x_f = float(tok)
+
+            if proj_mode == "cylindrical" or hfov_deg >= 175.0:
+                delta_deg = (x_f - 0.5) * hfov_deg
+            else:
+                tan_half = math.tan(math.radians(hfov_deg / 2.0))
+                delta_deg = math.degrees(math.atan((x_f - 0.5) * 2.0 * tan_half))
+
+            b_deg = (solved_center_az + delta_deg) % 360.0
+            x_entry = {}
+            if x_label:
+                x_entry["name"] = x_label
+            x_entry.update({
+                "x_fraction": round(x_f, 3),
+                "bearing_deg": round(b_deg, 2),
+                "cardinal": get_compass_cardinal(b_deg),
+                "offset_from_center_deg": round(delta_deg, 2),
+            })
+            x_proj_list.append(x_entry)
+        out["x_fraction_projections"] = x_proj_list
+
+    if project_bearings:
+        raw_b_tokens = []
+        if isinstance(project_bearings, (list, tuple)):
+            for item in project_bearings:
+                raw_b_tokens.extend(p.strip() for p in str(item).split(",") if p.strip())
+        else:
+            raw_b_tokens.extend(p.strip() for p in str(project_bearings).split(",") if p.strip())
+
+        b_proj_list = []
+        for tok in raw_b_tokens:
+            b_label = None
+            if ":" in tok:
+                b_label_part, b_val_part = tok.rsplit(":", 1)
+                b_label = b_label_part.strip()
+                b_val = float(b_val_part.strip()) % 360.0
+            else:
+                b_val = float(tok) % 360.0
+
+            in_fov, delta_deg, x_frac = project_bearing_to_fov(
+                b_val, solved_center_az, hfov_deg, projection=proj_mode
+            )
+            b_entry = {}
+            if b_label:
+                b_entry["name"] = b_label
+            b_entry.update({
+                "bearing_deg": round(b_val, 2),
+                "cardinal": get_compass_cardinal(b_val),
+                "in_fov": in_fov,
+                "projected_x_fraction": x_frac,
+                "angle_from_center_deg": delta_deg,
+            })
+            b_proj_list.append(b_entry)
+        out["bearing_projections"] = b_proj_list
+
+    return out
 
 
 def estimate_tz_offset(lon, dt):
@@ -235,11 +342,291 @@ def _shadow_2d_direction_for_camera(shadow_azimuth, cam_az):
     return round(rel_deg, 1), desc
 
 
+def _calculate_lunar_ephemeris(lat, lon, dt, tz_offset):
+    """
+    Pure-Python standard-library (math-only) Meeus lunar ephemeris (Ch. 47, 48, 40)
+    with topocentric horizontal parallax correction.
+    Returns dict of lunar_* fields for sun-position output.
+    """
+    utc_days = (dt - datetime(2000, 1, 1, 12, 0, 0)).total_seconds() / 86400.0 - (float(tz_offset) / 24.0)
+    T = utc_days / 36525.0
+    # Terrestrial Time (TT = UTC + ~69.184 s) for lunar orbital arguments
+    T_tt = (utc_days + 69.184 / 86400.0) / 36525.0
+
+    # Fundamental arguments (Meeus Ch. 47, degrees)
+    Lp = (
+        218.3164477
+        + 481267.88123421 * T_tt
+        - 0.0015786 * (T_tt ** 2)
+        + (T_tt ** 3) / 538841.0
+        - (T_tt ** 4) / 65194000.0
+    ) % 360.0
+    D = (
+        297.8501921
+        + 445267.1114034 * T_tt
+        - 0.0018819 * (T_tt ** 2)
+        + (T_tt ** 3) / 545868.0
+        - (T_tt ** 4) / 113065000.0
+    ) % 360.0
+    M = (
+        357.5291092
+        + 35999.0502909 * T_tt
+        - 0.0001536 * (T_tt ** 2)
+        + (T_tt ** 3) / 24490000.0
+    ) % 360.0
+    Mp = (
+        134.9633964
+        + 477198.8675055 * T_tt
+        + 0.0087414 * (T_tt ** 2)
+        + (T_tt ** 3) / 69699.0
+        - (T_tt ** 4) / 14712000.0
+    ) % 360.0
+    F = (
+        93.2720950
+        + 483202.0175233 * T_tt
+        - 0.0036539 * (T_tt ** 2)
+        - (T_tt ** 3) / 3526000.0
+        + (T_tt ** 4) / 863310000.0
+    ) % 360.0
+
+    A1 = (119.75 + 131.849 * T_tt) % 360.0
+    A2 = (53.09 + 479264.290 * T_tt) % 360.0
+    A3 = (313.45 + 481266.484 * T_tt) % 360.0
+    E = 1.0 - 0.002516 * T_tt - 0.0000074 * (T_tt ** 2)
+
+    # Meeus Table 47.A principal periodic terms: (D, M, Mp, F, coeff_l, coeff_r)
+    terms_lr = (
+        (0, 0, 1, 0, 6288774, -20905355),
+        (2, 0, -1, 0, 1274027, -3699111),
+        (2, 0, 0, 0, 658314, -2955968),
+        (0, 0, 2, 0, 213618, -569925),
+        (0, 1, 0, 0, -185116, 48888),
+        (0, 0, 0, 2, -114332, -3149),
+        (2, 0, -2, 0, 58793, 246158),
+        (2, -1, -1, 0, 57066, -152138),
+        (2, 0, 1, 0, 53322, -170733),
+        (2, -1, 0, 0, 45758, -204586),
+        (0, 1, -1, 0, -40923, -129620),
+        (1, 0, 0, 0, -34720, 108743),
+        (0, 1, 1, 0, -30383, 104755),
+        (2, 0, 0, -2, 15327, 10321),
+        (0, 0, 1, 2, -12528, 0),
+        (0, 0, 1, -2, 10980, 79661),
+        (4, 0, -1, 0, 10675, -34782),
+        (0, 0, 3, 0, 10034, -23210),
+        (4, 0, -2, 0, 8548, -21636),
+        (2, 1, -1, 0, -7888, 24208),
+        (2, 1, 0, 0, -6766, 30824),
+        (1, 0, -1, 0, -5163, -8379),
+        (1, 1, 0, 0, 4987, -16675),
+        (2, -1, 1, 0, 4036, -12831),
+        (2, 0, 2, 0, 3994, -10445),
+        (4, 0, 0, 0, 3861, -11650),
+        (2, 0, -3, 0, 3665, 14403),
+        (0, 1, -2, 0, -2689, -7003),
+        (2, 0, -1, 2, -2602, 0),
+        (2, -1, -2, 0, 2390, 10056),
+        (1, 0, 1, 0, -2348, 6322),
+        (2, -2, 0, 0, 2236, -9884),
+        (0, 1, 2, 0, -2120, 5751),
+        (0, 2, 0, 0, -2069, 0),
+        (2, -2, -1, 0, 2048, -4950),
+        (2, 0, 1, -2, -1773, 4130),
+        (2, 0, 0, 2, -1595, 0),
+        (4, -1, -1, 0, 1215, -3958),
+        (0, 0, 2, 2, -1110, 0),
+        (3, 0, -1, 0, -892, 3258),
+        (2, 1, 1, 0, -810, 2616),
+        (4, -1, -2, 0, 759, -1897),
+        (0, 2, -1, 0, -713, -2117),
+        (2, 2, -1, 0, -700, 2354),
+        (2, 1, -2, 0, 691, 0),
+        (2, -1, 0, -2, 596, 0),
+        (4, 0, 1, 0, 549, -1423),
+        (0, 0, 4, 0, 537, -1117),
+        (4, -1, 0, 0, 520, -1571),
+        (1, 0, -2, 0, -487, -1739),
+    )
+
+    # Meeus Table 47.B principal periodic terms for latitude: (D, M, Mp, F, coeff_b)
+    terms_b = (
+        (0, 0, 0, 1, 5128122),
+        (0, 0, 1, 1, 280602),
+        (0, 0, 1, -1, 277693),
+        (2, 0, 0, -1, 173237),
+        (2, 0, -1, 1, 55413),
+        (2, 0, -1, -1, 46271),
+        (2, 0, 0, 1, 32573),
+        (0, 0, 2, 1, 17198),
+        (2, 0, 1, -1, 9266),
+        (0, 0, 2, -1, 8822),
+        (2, -1, 0, -1, 8216),
+        (2, 0, -2, -1, 4324),
+        (2, 0, 1, 1, 4200),
+        (2, 1, 0, -1, -3359),
+        (2, -1, -1, 1, 2463),
+        (2, -1, 0, 1, 2211),
+        (2, -1, -1, -1, 2065),
+        (0, 1, -1, -1, -1870),
+        (4, 0, -1, -1, 1828),
+        (0, 1, 0, 1, -1794),
+        (0, 0, 0, 3, -1749),
+        (0, 1, -1, 1, -1565),
+        (1, 0, 0, 1, -1491),
+        (0, 1, 1, 1, -1475),
+        (0, 1, 1, -1, -1410),
+        (0, 1, 0, -1, -1344),
+        (1, 0, 0, -1, -1335),
+        (0, 0, 3, 1, 1107),
+        (4, 0, 0, -1, 1021),
+        (4, 0, -1, 1, 833),
+    )
+
+    sum_l = 0.0
+    sum_r = 0.0
+    for d_c, m_c, mp_c, f_c, cl, cr in terms_lr:
+        arg_rad = math.radians(d_c * D + m_c * M + mp_c * Mp + f_c * F)
+        ef = (E ** abs(m_c)) if m_c != 0 else 1.0
+        sum_l += cl * ef * math.sin(arg_rad)
+        if cr != 0:
+            sum_r += cr * ef * math.cos(arg_rad)
+
+    sum_l += (
+        3958.0 * math.sin(math.radians(A1))
+        + 1962.0 * math.sin(math.radians(Lp - F))
+        + 318.0 * math.sin(math.radians(A2))
+    )
+
+    sum_b = 0.0
+    for d_c, m_c, mp_c, f_c, cb in terms_b:
+        arg_rad = math.radians(d_c * D + m_c * M + mp_c * Mp + f_c * F)
+        ef = (E ** abs(m_c)) if m_c != 0 else 1.0
+        sum_b += cb * ef * math.sin(arg_rad)
+
+    sum_b += (
+        -2235.0 * math.sin(math.radians(Lp))
+        + 382.0 * math.sin(math.radians(A3))
+        + 175.0 * math.sin(math.radians(A1 - F))
+        + 175.0 * math.sin(math.radians(A1 + F))
+        + 127.0 * math.sin(math.radians(Lp - Mp))
+        - 115.0 * math.sin(math.radians(Lp + Mp))
+    )
+
+    # Geocentric ecliptic longitude, latitude, and distance (km)
+    lam_deg = (Lp + sum_l / 1000000.0) % 360.0
+    beta_deg = sum_b / 1000000.0
+    dist_km = 385000.56 + sum_r / 1000.0
+
+    # Equatorial horizontal parallax sin(pi)
+    sin_pi = 6378.14 / dist_km
+
+    # Obliquity of the ecliptic and geocentric equatorial (RA, Dec)
+    eps_rad = math.radians(
+        23.43929111 - 0.013004167 * T_tt - 1.63889e-7 * (T_tt ** 2) + 5.03611e-7 * (T_tt ** 3)
+    )
+    lam_rad = math.radians(lam_deg)
+    beta_rad = math.radians(beta_deg)
+
+    ra_rad = math.atan2(
+        math.sin(lam_rad) * math.cos(eps_rad) - math.tan(beta_rad) * math.sin(eps_rad),
+        math.cos(lam_rad),
+    )
+    ra_deg = (math.degrees(ra_rad) + 360.0) % 360.0
+    sin_dec = math.sin(beta_rad) * math.cos(eps_rad) + math.cos(beta_rad) * math.sin(eps_rad) * math.sin(lam_rad)
+    sin_dec = max(-1.0, min(1.0, sin_dec))
+    dec_rad = math.asin(sin_dec)
+
+    # Topocentric horizontal parallax correction (Meeus Ch. 40)
+    phi_rad = math.radians(float(lat))
+    u = math.atan(0.99664719 * math.tan(phi_rad))
+    # Use typical alpine elevation (~2500 m) for minor geoid height term
+    elev_ratio = 2500.0 / 6378140.0
+    rho_sin_phi_p = 0.99664719 * math.sin(u) + elev_ratio * math.sin(phi_rad)
+    rho_cos_phi_p = math.cos(u) + elev_ratio * math.cos(phi_rad)
+
+    # Greenwich Sidereal Time (degrees)
+    gmst_deg = (
+        280.46061837
+        + 360.98564736629 * utc_days
+        + 0.000387933 * (T ** 2)
+        - (T ** 3) / 38710000.0
+    ) % 360.0
+    H_deg = (gmst_deg + float(lon) - ra_deg) % 360.0
+    H_rad = math.radians(H_deg)
+
+    denom = math.cos(dec_rad) - rho_cos_phi_p * sin_pi * math.cos(H_rad)
+    delta_ra_rad = math.atan2(-rho_cos_phi_p * sin_pi * math.sin(H_rad), denom)
+    H_topo_rad = H_rad - delta_ra_rad
+    dec_topo_rad = math.atan2(
+        (math.sin(dec_rad) - rho_sin_phi_p * sin_pi) * math.cos(delta_ra_rad),
+        denom,
+    )
+
+    sin_alt_topo = (
+        math.sin(phi_rad) * math.sin(dec_topo_rad)
+        + math.cos(phi_rad) * math.cos(dec_topo_rad) * math.cos(H_topo_rad)
+    )
+    sin_alt_topo = max(-1.0, min(1.0, sin_alt_topo))
+    lunar_alt_deg = math.degrees(math.asin(sin_alt_topo))
+
+    az_y = math.sin(H_topo_rad)
+    az_x = math.cos(H_topo_rad) * math.sin(phi_rad) - math.tan(dec_topo_rad) * math.cos(phi_rad)
+    lunar_az_deg = (math.degrees(math.atan2(az_y, az_x)) + 180.0) % 360.0
+
+    # Illuminated fraction and phase name (Meeus Ch. 48)
+    sun_L0 = (280.46646 + 36000.76983 * T_tt + 0.0003032 * (T_tt ** 2)) % 360.0
+    M_rad = math.radians(M)
+    sun_C = (
+        (1.914602 - 0.004817 * T_tt - 0.000014 * (T_tt ** 2)) * math.sin(M_rad)
+        + (0.019993 - 0.000101 * T_tt) * math.sin(2.0 * M_rad)
+        + 0.000289 * math.sin(3.0 * M_rad)
+    )
+    sun_lam_deg = (sun_L0 + sun_C) % 360.0
+    synodic_elong_deg = (lam_deg - sun_lam_deg) % 360.0
+
+    cos_psi = math.cos(beta_rad) * math.cos(math.radians(synodic_elong_deg))
+    cos_psi = max(-1.0, min(1.0, cos_psi))
+    sin_psi = math.sqrt(max(0.0, 1.0 - cos_psi * cos_psi))
+    sun_dist_km = 149598000.0
+    phase_angle_rad = math.atan2(sun_dist_km * sin_psi, dist_km - sun_dist_km * cos_psi)
+    illum_frac = (1.0 + math.cos(phase_angle_rad)) / 2.0
+    illum_frac = max(0.0, min(1.0, illum_frac))
+
+    if synodic_elong_deg < 6.0 or synodic_elong_deg >= 354.0 or illum_frac < 0.015:
+        phase_name = "New Moon"
+    elif 174.0 <= synodic_elong_deg <= 186.0 or illum_frac > 0.985:
+        phase_name = "Full Moon"
+    elif synodic_elong_deg < 180.0:
+        if 84.0 <= synodic_elong_deg <= 96.0:
+            phase_name = "First Quarter"
+        elif synodic_elong_deg < 90.0:
+            phase_name = "Waxing Crescent"
+        else:
+            phase_name = "Waxing Gibbous"
+    else:
+        if 264.0 <= synodic_elong_deg <= 276.0:
+            phase_name = "Last Quarter"
+        elif synodic_elong_deg < 270.0:
+            phase_name = "Waning Gibbous"
+        else:
+            phase_name = "Waning Crescent"
+
+    return {
+        "lunar_altitude_deg": round(lunar_alt_deg, 2),
+        "lunar_azimuth_deg": round(lunar_az_deg, 2),
+        "lunar_cardinal": get_compass_cardinal(lunar_az_deg),
+        "lunar_illumination_fraction": round(illum_frac, 3),
+        "lunar_phase_name": phase_name,
+        "is_moon_above_horizon": bool(lunar_alt_deg > 0.0),
+    }
+
+
 def calculate_solar_position(lat, lon, dt, tz_offset=None, center_az=None):
     """
-    Standard NOAA Solar Position Algorithm approximation.
+    Standard NOAA Solar Position Algorithm approximation plus Meeus topocentric lunar ephemeris.
     Returns solar altitude (degrees above horizon), solar azimuth (degrees clockwise from North),
-    8-octant flat-ground 2D image-plane shadow lookup, and reverse clock-to-camera-bearing lookup.
+    topocentric lunar position/phase fields (lunar_*), 8-octant flat-ground 2D image-plane shadow lookup,
+    and reverse clock-to-camera-bearing lookup.
     """
     if tz_offset is None:
         tz_offset = estimate_tz_offset(lon, dt)
@@ -289,6 +676,7 @@ def calculate_solar_position(lat, lon, dt, tz_offset=None, center_az=None):
         solar_azimuth = (540.0 - azimuth_deg) % 360.0
 
     shadow_azimuth = (solar_azimuth + 180.0) % 360.0
+    lunar_info = _calculate_lunar_ephemeris(lat, lon, dt, tz_offset)
 
     octants = [
         ("N", 0.0),
@@ -331,6 +719,12 @@ def calculate_solar_position(lat, lon, dt, tz_offset=None, center_az=None):
         "solar_cardinal": get_compass_cardinal(solar_azimuth),
         "shadow_azimuth_deg": round(shadow_azimuth, 1),
         "shadow_cardinal": get_compass_cardinal(shadow_azimuth),
+        "lunar_altitude_deg": lunar_info["lunar_altitude_deg"],
+        "lunar_azimuth_deg": lunar_info["lunar_azimuth_deg"],
+        "lunar_cardinal": lunar_info["lunar_cardinal"],
+        "lunar_illumination_fraction": lunar_info["lunar_illumination_fraction"],
+        "lunar_phase_name": lunar_info["lunar_phase_name"],
+        "is_moon_above_horizon": lunar_info["is_moon_above_horizon"],
         "tz_offset_hours": tz_offset,
         "flat_ground_2d_shadow_by_camera_octant": shadow_by_octant,
         "observed_2d_shadow_clock_to_camera_bearing": clock_to_bearing,
@@ -643,12 +1037,37 @@ def query_admin_boundaries(lat, lon, timeout=3.0):
     return out
 
 
+def _extract_arcgis_lon_lat(geom):
+    """
+    Extracts (lon, lat) from ArcGIS point ('x', 'y'), multipoint ('points'),
+    or polygon ('rings') geometry.
+    """
+    if not isinstance(geom, dict):
+        return None, None
+    if "x" in geom and "y" in geom and geom["x"] is not None and geom["y"] is not None:
+        return float(geom["x"]), float(geom["y"])
+    pts = geom.get("points")
+    if pts and isinstance(pts, list) and len(pts) > 0 and len(pts[0]) >= 2:
+        return float(pts[0][0]), float(pts[0][1])
+    rings = geom.get("rings")
+    if rings and isinstance(rings, list) and len(rings) > 0:
+        ring = rings[0]
+        if ring and len(ring) > 0:
+            pts_ring = ring[:-1] if (len(ring) > 1 and ring[0] == ring[-1]) else ring
+            if pts_ring:
+                lon = sum(float(p[0]) for p in pts_ring) / len(pts_ring)
+                lat = sum(float(p[1]) for p in pts_ring) / len(pts_ring)
+                return lon, lat
+    return None, None
+
+
 def query_usgs_gnis(lat, lon, radius_km=12.0, _return_status=False):
     """
     Queries USGS Geographic Names Information System (GNIS) ArcGIS REST service.
     Layer 5: Landforms (Summit, Ridge, Gap, Valley, Basin, Cliff, Pillar, Flat, Range)
     Layer 6: Streams (Mouth)
     Layer 7: Other Hydrographic Features (Lake, Falls, Glacier, Swamp)
+    Supports point ('x', 'y'), multipoint ('points'), and polygon ('rings') geometries.
     """
     dlat = radius_km / 111.0
     dlon = radius_km / (111.0 * math.cos(math.radians(lat)))
@@ -671,6 +1090,10 @@ def query_usgs_gnis(lat, lon, radius_km=12.0, _return_status=False):
         try:
             raw_bytes = _fetch_url_bytes(url, timeout=9.0)
             data = json.loads(raw_bytes.decode("utf-8"))
+            if "error" in data:
+                had_error[0] = True
+                sys.stderr.write(f"USGS GNIS layer {layer_id} returned error: {data['error']}\n")
+                return []
             return data.get("features", [])
         except Exception as e:
             had_error[0] = True
@@ -683,10 +1106,7 @@ def query_usgs_gnis(lat, lon, radius_km=12.0, _return_status=False):
             for item in layer_items:
                 attr = item.get("attributes", {})
                 geom = item.get("geometry", {})
-                pts = geom.get("points") or []
-                if not pts:
-                    continue
-                f_lon, f_lat = pts[0][0], pts[0][1]
+                f_lon, f_lat = _extract_arcgis_lon_lat(geom)
                 name = attr.get("gaz_name")
                 f_type = attr.get("gaz_featureclass")
                 if not name or f_lat is None or f_lon is None:
@@ -712,31 +1132,258 @@ def query_usgs_gnis(lat, lon, radius_km=12.0, _return_status=False):
     return features
 
 
+def query_usgs_waterbodies(lat, lon, radius_km=12.0, unnamed_radius_km=2.5, _return_status=False):
+    """
+    Queries USGS National Hydrography Dataset (NHD) MapServer Layer 12 (NHDWaterbody) for:
+    1. Named lakes/waterbodies (GNIS_NAME IS NOT NULL) across the full radius_km.
+    2. Unnamed alpine tarns/waterbodies within unnamed_radius_km (default 2.5 km around grid center),
+       restricted by FType/FCODE to LakePond (FType=390 or FCODE IN (39000,39004,39009,39010,39011,39012))
+       and Reservoir (FType=436), excluding SwampMarsh (466), Ice Mass (378), and tiny seasonal puddles
+       (AreaSqKm < 0.0005 when AreaSqKm is populated).
+    """
+    nhd_url = "https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer/12/query"
+    had_error = [False]
+    valid_unnamed_fcodes = {39000, 39004, 39009, 39010, 39011, 39012}
+
+    def fetch_named():
+        dlat = radius_km / 111.0
+        dlon = radius_km / (111.0 * math.cos(math.radians(lat)))
+        env = f"{lon - dlon:.4f},{lat - dlat:.4f},{lon + dlon:.4f},{lat + dlat:.4f}"
+        params = {
+            "geometry": env,
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "where": "GNIS_NAME IS NOT NULL",
+            "outFields": "GNIS_NAME,FTYPE,FCODE,AREASQKM,ELEVATION",
+            "returnGeometry": "true",
+            "maxAllowableOffset": "0.0002",
+            "outSR": "4326",
+            "f": "json",
+        }
+        try:
+            raw_bytes = _fetch_url_bytes(nhd_url + "?" + urllib.parse.urlencode(params), timeout=8.5)
+            data = json.loads(raw_bytes.decode("utf-8"))
+            if "error" in data:
+                had_error[0] = True
+                sys.stderr.write(f"USGS NHD named waterbodies query error: {data['error']}\n")
+                return []
+            return data.get("features", [])
+        except Exception as e:
+            had_error[0] = True
+            sys.stderr.write(f"USGS NHD named waterbodies query failed: {e}\n")
+            return []
+
+    def fetch_unnamed():
+        u_rad = min(float(radius_km), float(unnamed_radius_km))
+        dlat = u_rad / 111.0
+        dlon = u_rad / (111.0 * math.cos(math.radians(lat)))
+        env = f"{lon - dlon:.4f},{lat - dlat:.4f},{lon + dlon:.4f},{lat + dlat:.4f}"
+        params = {
+            "geometry": env,
+            "geometryType": "esriGeometryEnvelope",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+            "where": "GNIS_NAME IS NULL AND (FTYPE IN (390, 436) OR FCODE IN (39000, 39004, 39009, 39010, 39011, 39012))",
+            "outFields": "GNIS_NAME,FTYPE,FCODE,AREASQKM,ELEVATION",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "f": "json",
+        }
+        try:
+            raw_bytes = _fetch_url_bytes(nhd_url + "?" + urllib.parse.urlencode(params), timeout=8.0)
+            data = json.loads(raw_bytes.decode("utf-8"))
+            if "error" in data:
+                had_error[0] = True
+                sys.stderr.write(f"USGS NHD unnamed waterbodies query error: {data['error']}\n")
+                return []
+            return data.get("features", [])
+        except Exception as e:
+            had_error[0] = True
+            sys.stderr.write(f"USGS NHD unnamed waterbodies query failed: {e}\n")
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_named = pool.submit(fetch_named)
+        fut_unnamed = pool.submit(fetch_unnamed)
+        named_items = fut_named.result()
+        unnamed_items = fut_unnamed.result()
+
+    named_by_key = {}
+    for item in named_items:
+        attr = item.get("attributes") or {}
+        attr_ci = {str(k).upper(): v for k, v in attr.items()}
+        name = (attr_ci.get("GNIS_NAME") or "").strip()
+        if not name:
+            continue
+        ftype = attr_ci.get("FTYPE")
+        fcode = attr_ci.get("FCODE")
+        try:
+            ftype = int(ftype) if ftype is not None else None
+        except (ValueError, TypeError):
+            ftype = None
+        try:
+            fcode = int(fcode) if fcode is not None else None
+        except (ValueError, TypeError):
+            fcode = None
+
+        # Exclude SwampMarsh (466)
+        if ftype == 466 or (fcode is not None and 46600 <= fcode < 46700):
+            continue
+        f_type = "Glacier" if (ftype == 378 or (fcode is not None and 37800 <= fcode < 37900)) else "Lake"
+
+        f_lon, f_lat = _extract_arcgis_lon_lat(item.get("geometry") or {})
+        if f_lat is None or f_lon is None:
+            continue
+        calc = calculate_haversine(lat, lon, f_lat, f_lon)
+        if calc["distance_km"] > radius_km:
+            continue
+
+        area_val = attr_ci.get("AREASQKM")
+        try:
+            area_sqkm = float(area_val) if area_val is not None else 0.0
+        except (ValueError, TypeError):
+            area_sqkm = 0.0
+
+        rec = {
+            "name": name,
+            "type": f_type,
+            "distance_mi": calc["distance_mi"],
+            "distance_km": calc["distance_km"],
+            "bearing_deg": calc["bearing_deg"],
+            "cardinal": calc["cardinal"],
+            "elevation_ft": None,
+            "elevation_m": None,
+            "lat": round(f_lat, 6),
+            "lon": round(f_lon, 6),
+            "source": "USGS NHD",
+            "_area_sqkm": area_sqkm,
+        }
+        k = name.lower()
+        if k not in named_by_key or area_sqkm > named_by_key[k].get("_area_sqkm", 0.0):
+            named_by_key[k] = rec
+
+    features = []
+    for rec in named_by_key.values():
+        rec.pop("_area_sqkm", None)
+        features.append(rec)
+
+    u_rad = min(float(radius_km), float(unnamed_radius_km))
+    for item in unnamed_items:
+        attr = item.get("attributes") or {}
+        attr_ci = {str(k).upper(): v for k, v in attr.items()}
+        if (attr_ci.get("GNIS_NAME") or "").strip():
+            continue
+        ftype = attr_ci.get("FTYPE")
+        fcode = attr_ci.get("FCODE")
+        try:
+            ftype = int(ftype) if ftype is not None else None
+        except (ValueError, TypeError):
+            ftype = None
+        try:
+            fcode = int(fcode) if fcode is not None else None
+        except (ValueError, TypeError):
+            fcode = None
+
+        # Restrict unnamed NHD waterbodies to LakePond (FType=390 or FCODE in valid_unnamed_fcodes) and Reservoir (FType=436)
+        if ftype in (466, 378):
+            continue
+        if not (ftype in (390, 436) or (fcode in valid_unnamed_fcodes)):
+            continue
+
+        area_val = attr_ci.get("AREASQKM")
+        if area_val is not None:
+            try:
+                if float(area_val) < 0.0005:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        f_lon, f_lat = _extract_arcgis_lon_lat(item.get("geometry") or {})
+        if f_lat is None or f_lon is None:
+            continue
+        calc = calculate_haversine(lat, lon, f_lat, f_lon)
+        if calc["distance_km"] > u_rad:
+            continue
+
+        features.append({
+            "name": f"Unnamed Tarn / Water Body ({f_lat:.4f}, {f_lon:.4f})",
+            "type": "Lake",
+            "distance_mi": calc["distance_mi"],
+            "distance_km": calc["distance_km"],
+            "bearing_deg": calc["bearing_deg"],
+            "cardinal": calc["cardinal"],
+            "elevation_ft": None,
+            "elevation_m": None,
+            "lat": round(f_lat, 6),
+            "lon": round(f_lon, 6),
+            "source": "USGS NHD",
+            "is_unnamed_water": True,
+        })
+
+    if _return_status:
+        return features, (not had_error[0])
+    return features
+
+
 def query_overpass_peaks(lat, lon, radius_km=10.0, _return_status=False):
     """
     Queries Overpass API via POST with encoded payload to enrich or supplement features,
-    including unnamed alpine tarns/lakes within 1.5 km.
+    including multipolygon water relations within 8 km and unnamed alpine tarns/lakes within 2.5 km.
+    Enforces a strict <= 7.0s total wall-clock budget across primary and at most one fast fallback.
     """
-    radius_m = int(min(radius_km, 22.0) * 1000)
-    unnamed_water_m = min(radius_m, 2200)
-    query = f"""[out:json][timeout:4];
+    radius_m = int(min(radius_km, 15.0) * 1000)
+    water_radius_m = min(radius_m, 8000)
+    unnamed_water_m = min(radius_m, 2500)
+
+    dlat = (radius_m / 1000.0) / 111.0
+    dlon = (radius_m / 1000.0) / (111.0 * math.cos(math.radians(lat)))
+    bbox_str = f"{lat - dlat:.4f},{lon - dlon:.4f},{lat + dlat:.4f},{lon + dlon:.4f}"
+
+    endpoints = [
+        ("https://overpass-api.de/api/interpreter", 4, 4.2),
+        ("https://overpass.kumi.systems/api/interpreter", 3, 2.8),
+    ]
+    t_start = time.monotonic()
+    res_data = None
+    ok = False
+
+    for idx, (endpoint_url, ovp_timeout, req_timeout) in enumerate(endpoints):
+        elapsed = time.monotonic() - t_start
+        rem_budget = 7.0 - elapsed
+        if rem_budget < 1.2:
+            break
+        eff_req_timeout = min(req_timeout, max(1.2, rem_budget - 0.1))
+        eff_ovp_timeout = min(ovp_timeout, max(1, int(eff_req_timeout)))
+        query = f"""[out:json][timeout:{eff_ovp_timeout}][bbox:{bbox_str}];
 (
   node(around:{radius_m},{lat},{lon})["natural"="peak"]["name"];
   node(around:{radius_m},{lat},{lon})["natural"="water"]["name"];
   node(around:{radius_m},{lat},{lon})["natural"="saddle"]["name"];
-  way(around:{radius_m},{lat},{lon})["natural"="water"]["name"];
+  way(around:{water_radius_m},{lat},{lon})["natural"="water"]["name"];
+  relation(around:{water_radius_m},{lat},{lon})["natural"="water"]["name"];
   way(around:{unnamed_water_m},{lat},{lon})["natural"="water"][!"name"]["water"!~"river|stream|canal|ditch"];
   relation(around:{unnamed_water_m},{lat},{lon})["natural"="water"][!"name"]["water"!~"river|stream|canal|ditch"];
 );
 out center tags;
 """
-    data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+        data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+        try:
+            raw_bytes = _fetch_url_bytes(endpoint_url, data=data, timeout=eff_req_timeout)
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+            if "remark" in parsed:
+                sys.stderr.write(f"Overpass runtime remark on {endpoint_url}: {parsed.get('remark')}\n")
+                ok = False
+                continue
+            res_data = parsed
+            ok = True
+            break
+        except Exception as e:
+            sys.stderr.write(f"Overpass query failed on {endpoint_url} (attempt {idx + 1}): {e}\n")
+            ok = False
+
     features = []
-    ok = False
-    try:
-        raw_bytes = _fetch_url_bytes("https://overpass-api.de/api/interpreter", data=data, timeout=4.5)
-        res_data = json.loads(raw_bytes.decode("utf-8"))
-        ok = True
+    if ok and res_data:
         for el in res_data.get("elements", []):
             tags = el.get("tags", {})
             f_lat = el.get("lat") or (el.get("center", {}).get("lat"))
@@ -782,8 +1429,6 @@ out center tags;
             if is_unnamed_water:
                 item["is_unnamed_water"] = True
             features.append(item)
-    except Exception:
-        pass
 
     if _return_status:
         return features, ok
@@ -793,46 +1438,16 @@ out center tags;
 _MEM_FEATURES_CACHE = {}
 
 
-def find_nearby_features(lat, lon, radius_km=12.0, verbose=False):
+def _merge_feature_catalog(feature_lists):
     """
-    Finds nearby geographic features (summits, ridges, gaps, lakes, basins, valleys, streams)
-    around (lat, lon). Caches ONLY camera-independent raw feature records in %TEMP% keyed by
-    (round(lat, 2), round(lon, 2), quantized_radius_km) and recomputes exact caller-relative
-    distance and bearing on every call.
+    Merges raw feature records from GNIS, NHD, and Overpass, deduplicating named features by
+    case-insensitive name and spatially deduplicating unnamed water bodies within 100 m (0.10 km).
     """
-    dem = get_dem_patch(lat, lon, radius_km=radius_km)
-    grid_lat = round(float(lat), 2)
-    grid_lon = round(float(lon), 2)
-    q_radius_km = int(math.ceil(max(5.0, float(radius_km)) / 5.0) * 5)
-    cache_key = f"v2_{grid_lat:.2f}_{grid_lon:.2f}_{q_radius_km}"
-
-    raw_catalog = _MEM_FEATURES_CACHE.get(cache_key)
-    cache_dir = tempfile.gettempdir()
-    key_hash = hashlib.md5(cache_key.encode("utf-8")).hexdigest()[:14]
-    cache_path = os.path.join(cache_dir, f"photo_analysis_features_{cache_key}_{key_hash}.json")
-
-    if raw_catalog is None and os.path.exists(cache_path):
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, list) and len(loaded) > 0:
-                raw_catalog = loaded
-                _MEM_FEATURES_CACHE[cache_key] = raw_catalog
-        except Exception:
-            raw_catalog = None
-
-    if raw_catalog is None:
-        # Query with +1.5 km margin around grid center so edge callers within the 0.01 deg cell lose nothing
-        search_r = float(q_radius_km) + 1.5
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_gnis = pool.submit(query_usgs_gnis, grid_lat, grid_lon, search_r, True)
-            fut_osm = pool.submit(query_overpass_peaks, grid_lat, grid_lon, min(search_r, 22.0), True)
-            gnis_features, gnis_ok = fut_gnis.result()
-            osm_features, osm_ok = fut_osm.result()
-
-        by_name = {}
-        for f in gnis_features + osm_features:
-            key = f["name"].strip().lower()
+    by_name = {}
+    unnamed_waters = []
+    for feat_list in feature_lists:
+        for f in (feat_list or []):
+            is_unnamed = bool(f.get("is_unnamed_water") or str(f.get("name", "")).startswith("Unnamed Tarn / Water Body"))
             raw_rec = {
                 "name": f["name"],
                 "type": f["type"],
@@ -841,38 +1456,141 @@ def find_nearby_features(lat, lon, radius_km=12.0, verbose=False):
                 "elevation_ft": f.get("elevation_ft"),
                 "elevation_m": f.get("elevation_m"),
                 "source": f.get("source", "USGS GNIS"),
-                "is_unnamed_water": bool(f.get("is_unnamed_water", False)),
+                "is_unnamed_water": is_unnamed,
             }
-            if key not in by_name:
-                by_name[key] = raw_rec
+            if is_unnamed:
+                duplicate_found = False
+                for existing_uw in unnamed_waters:
+                    d_uw = calculate_haversine(existing_uw["lat"], existing_uw["lon"], raw_rec["lat"], raw_rec["lon"])
+                    if d_uw["distance_km"] <= 0.10:
+                        if existing_uw.get("elevation_ft") is None and raw_rec.get("elevation_ft") is not None:
+                            existing_uw["elevation_ft"] = raw_rec["elevation_ft"]
+                            existing_uw["elevation_m"] = raw_rec["elevation_m"]
+                        duplicate_found = True
+                        break
+                if not duplicate_found:
+                    unnamed_waters.append(raw_rec)
             else:
-                existing = by_name[key]
-                if existing.get("elevation_ft") is None and raw_rec.get("elevation_ft") is not None:
-                    existing["elevation_ft"] = raw_rec["elevation_ft"]
-                    existing["elevation_m"] = raw_rec["elevation_m"]
+                key = f["name"].strip().lower()
+                if key not in by_name:
+                    by_name[key] = raw_rec
+                else:
+                    existing = by_name[key]
+                    if existing.get("type") == "Swamp" and raw_rec.get("type") == "Lake":
+                        existing["type"] = "Lake"
+                    if existing.get("elevation_ft") is None and raw_rec.get("elevation_ft") is not None:
+                        existing["elevation_ft"] = raw_rec["elevation_ft"]
+                        existing["elevation_m"] = raw_rec["elevation_m"]
+    return list(by_name.values()) + unnamed_waters
 
-        raw_catalog = list(by_name.values())
-        # Only persist to disk when both GNIS and OSM succeeded without error and returned records
-        if gnis_ok and len(raw_catalog) > 0:
-            _MEM_FEATURES_CACHE[cache_key] = raw_catalog
-            if osm_ok:
+
+def find_nearby_features(lat, lon, radius_km=12.0, verbose=False):
+    """
+    Finds nearby geographic features (summits, ridges, gaps, lakes, basins, valleys, streams)
+    around (lat, lon). Caches ONLY camera-independent raw feature records in %TEMP% keyed by
+    v3_(round(lat, 2), round(lon, 2), quantized_radius_km), reuses any larger-radius cache
+    (R >= q_radius_km), tracks provider completeness (gnis_ok, nhd_ok, overpass_ok) to prevent
+    cache poisoning, and recomputes exact caller-relative distance and bearing on every call.
+    """
+    dem = get_dem_patch(lat, lon, radius_km=radius_km)
+    grid_lat = round(float(lat), 2)
+    grid_lon = round(float(lon), 2)
+    q_radius_km = int(math.ceil(max(5.0, float(radius_km)) / 5.0) * 5)
+    cache_dir = tempfile.gettempdir()
+
+    candidate_radii = sorted(set([q_radius_km] + [r for r in (15, 20, 25, 30, 35, 40) if r >= q_radius_km]))
+    raw_catalog = None
+    partial_state = None
+    partial_r = q_radius_km
+
+    for cand_r in candidate_radii:
+        cand_key = f"v3_{grid_lat:.2f}_{grid_lon:.2f}_{cand_r}"
+        cand_hash = hashlib.md5(cand_key.encode("utf-8")).hexdigest()[:14]
+        cand_path = os.path.join(cache_dir, f"photo_analysis_features_{cand_key}_{cand_hash}.json")
+
+        loaded = _MEM_FEATURES_CACHE.get(cand_key)
+        if loaded is None and os.path.exists(cand_path):
+            try:
+                with open(cand_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict) and loaded.get("features"):
+                    _MEM_FEATURES_CACHE[cand_key] = loaded
+            except Exception:
+                loaded = None
+
+        if isinstance(loaded, dict) and loaded.get("features"):
+            if loaded.get("gnis_ok") and loaded.get("nhd_ok"):
+                raw_catalog = loaded["features"]
+                break
+            elif partial_state is None and cand_r >= q_radius_km:
+                partial_state = loaded
+                partial_r = cand_r
+
+    if raw_catalog is None:
+        eff_r = partial_r if partial_state is not None else q_radius_km
+        cache_key = f"v3_{grid_lat:.2f}_{grid_lon:.2f}_{eff_r}"
+        key_hash = hashlib.md5(cache_key.encode("utf-8")).hexdigest()[:14]
+        cache_path = os.path.join(cache_dir, f"photo_analysis_features_{cache_key}_{key_hash}.json")
+
+        # Query with +1.5 km margin around grid center so edge callers within the 0.01 deg cell lose nothing
+        search_r = float(eff_r) + 1.5
+        need_gnis = not (partial_state and partial_state.get("gnis_ok"))
+        need_nhd = not (partial_state and partial_state.get("nhd_ok"))
+        need_osm = not (partial_state and partial_state.get("overpass_ok"))
+
+        gnis_features, gnis_ok = ([], True) if not need_gnis else ([], False)
+        nhd_features, nhd_ok = ([], True) if not need_nhd else ([], False)
+        osm_features, osm_ok = ([], True) if not need_osm else ([], False)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            fut_gnis = pool.submit(query_usgs_gnis, grid_lat, grid_lon, search_r, True) if need_gnis else None
+            fut_nhd = pool.submit(query_usgs_waterbodies, grid_lat, grid_lon, search_r, 2.5, True) if need_nhd else None
+            fut_osm = pool.submit(query_overpass_peaks, grid_lat, grid_lon, min(search_r, 22.0), True) if need_osm else None
+
+            if fut_gnis is not None:
+                gnis_features, gnis_ok = fut_gnis.result()
+            if fut_nhd is not None:
+                nhd_features, nhd_ok = fut_nhd.result()
+            if fut_osm is not None:
+                osm_features, osm_ok = fut_osm.result()
+
+        prior_features = partial_state.get("features", []) if partial_state else []
+        raw_catalog = _merge_feature_catalog([prior_features, gnis_features, nhd_features, osm_features])
+
+        cache_obj = {
+            "gnis_ok": bool(gnis_ok),
+            "nhd_ok": bool(nhd_ok),
+            "overpass_ok": bool(osm_ok),
+            "radius_km": eff_r,
+            "features": raw_catalog,
+        }
+        if len(raw_catalog) > 0:
+            _MEM_FEATURES_CACHE[cache_key] = cache_obj
+            # Only persist to disk when both USGS GNIS (landforms) and USGS NHD (lakes/tarns) succeeded
+            if gnis_ok and nhd_ok:
                 try:
                     tmp_path = f"{cache_path}.tmp.{os.getpid()}"
                     with open(tmp_path, "w", encoding="utf-8") as f:
-                        json.dump(raw_catalog, f)
+                        json.dump(cache_obj, f)
                     os.replace(tmp_path, cache_path)
                 except Exception:
                     pass
 
-    # Recompute exact caller-relative distance and bearing on every invocation
+    # Recompute exact caller-relative distance and bearing on every invocation,
+    # and enforce 100 m (0.10 km) spatial proximity deduplication on unnamed water bodies
     caller_features = []
+    seen_unnamed_coords = []
     for raw in raw_catalog:
         calc = calculate_haversine(lat, lon, raw["lat"], raw["lon"])
         if calc["distance_km"] > radius_km:
             continue
         is_unnamed_water = bool(raw.get("is_unnamed_water") or str(raw.get("name", "")).startswith("Unnamed Tarn / Water Body"))
-        if is_unnamed_water and calc["distance_km"] > 1.5:
-            continue
+        if is_unnamed_water:
+            if calc["distance_km"] > 1.5:
+                continue
+            if any(calculate_haversine(u_lat, u_lon, raw["lat"], raw["lon"])["distance_km"] <= 0.10 for u_lat, u_lon in seen_unnamed_coords):
+                continue
+            seen_unnamed_coords.append((raw["lat"], raw["lon"]))
         if not verbose and raw.get("type") == "Stream" and calc["distance_km"] > 5.0:
             continue
         caller_features.append({
@@ -1189,6 +1907,8 @@ def compute_elevation_profile(
         "distance_km": total_dist["distance_km"],
         "total_distance_mi": total_dist["distance_mi"],
         "total_distance_km": total_dist["distance_km"],
+        "target_lat": round(float(lat2), 6),
+        "target_lon": round(float(lon2), 6),
         "camera_elevation_ft": cam_ft,
         "camera_elevation_m": cam_m,
         "target_elevation_ft": tgt_ft,
@@ -1374,12 +2094,14 @@ def compute_horizon_skyline(
             "type": f_type,
             "geometry_type": geom_type,
             "bearing_deg": f["bearing_deg"],
+            "azimuth_deg": f["bearing_deg"],
             "cardinal": f["cardinal"],
             "distance_mi": f["distance_mi"],
             "distance_km": f["distance_km"],
             "elevation_ft": f_elev_ft,
             "elevation_m": f_elev_m,
             "target_vertical_angle_deg": prof["target_vertical_angle_deg"],
+            "vertical_angle_deg": prof["target_vertical_angle_deg"],
             "max_intervening_angle_deg": prof["max_intervening_angle_deg"],
             "clearance_deg": prof["clearance_deg"],
             "line_of_sight": los,
@@ -1422,9 +2144,13 @@ def compute_horizon_skyline(
                 "name": entry["name"],
                 "type": f_type,
                 "bearing_deg": entry["bearing_deg"],
+                "azimuth_deg": entry["bearing_deg"],
                 "distance_mi": entry["distance_mi"],
+                "distance_km": entry["distance_km"],
                 "elevation_ft": entry["elevation_ft"],
+                "elevation_m": entry["elevation_m"],
                 "target_vertical_angle_deg": entry["target_vertical_angle_deg"],
+                "vertical_angle_deg": entry["target_vertical_angle_deg"],
                 "clearance_deg": entry["clearance_deg"],
                 "line_of_sight": los,
                 "occluded_by": entry.get("occluded_by"),
@@ -1546,8 +2272,10 @@ def compute_horizon_skyline(
             e_ft = round(e_m * 3.280839895)
             horizon_rays.append({
                 "azimuth_deg": round(az, 1),
+                "bearing_deg": round(az, 1),
                 "cardinal": get_compass_cardinal(az),
                 "vertical_angle_deg": round(best_angle, 2),
+                "target_vertical_angle_deg": round(best_angle, 2),
                 "distance_mi": round(d_m / 1609.344, 2),
                 "distance_km": round(d_m / 1000.0, 2),
                 "elevation_ft": e_ft,
@@ -1562,14 +2290,23 @@ def compute_horizon_skyline(
             right_ang = horizon_rays[i + 1]["vertical_angle_deg"] if i + 1 < len(horizon_rays) else r["vertical_angle_deg"] - 0.1
             if r["vertical_angle_deg"] >= left_ang and r["vertical_angle_deg"] >= right_ang:
                 matched_name = None
+                nearest_nf_str = None
+                best_nf_dist = 2.51
                 for nf in all_named:
-                    if nf.get("type") in ("Summit", "Ridge", "Peak", "Cliff", "Pillar"):
+                    nf_type = nf.get("type")
+                    if nf_type in ("Summit", "Ridge", "Gap", "Saddle", "Peak", "Cliff", "Pillar"):
                         d_match = calculate_haversine(r["lat"], r["lon"], nf["lat"], nf["lon"])
-                        if d_match["distance_km"] <= 0.45:
+                        d_km = d_match["distance_km"]
+                        if d_km <= 0.45 and matched_name is None and nf_type in ("Summit", "Ridge", "Peak", "Cliff", "Pillar"):
                             matched_name = nf["name"]
-                            break
+                        if d_km <= 2.5 and d_km < best_nf_dist:
+                            best_nf_dist = d_km
+                            nearest_nf_str = f"{nf['name']} ({nf_type}, {d_km:.2f} km / {d_match['distance_mi']:.2f} mi)"
                 item = dict(r)
-                item["matched_named_feature"] = matched_name or f"Unnamed Horizon Highpoint (~{r['elevation_ft']:,} ft / {r['elevation_m']:,} m)"
+                matched_label = matched_name or f"Unnamed Horizon Highpoint (~{r['elevation_ft']:,} ft / {r['elevation_m']:,} m)"
+                item["matched_named_feature"] = matched_label
+                item["matched_feature"] = matched_label
+                item["nearest_named_feature"] = nearest_nf_str
                 if eff_center_az is not None:
                     in_fov, delta_deg, x_frac = project_bearing_to_fov(
                         r["azimuth_deg"], eff_center_az, eff_hfov_deg, projection=proj_mode
@@ -1609,16 +2346,24 @@ def compute_horizon_skyline(
             e_m = float(fg_elevs[idx_az, best_j])
             p_lat = float(fg_lats[idx_az, best_j])
             p_lon = float(fg_lons[idx_az, best_j])
+            e_ft_fg = round(e_m * 3.280839895)
+            e_m_fg = round(e_m)
+            fg_lbl = f"Foreground Ridge (~{e_ft_fg:,} ft / {e_m_fg:,} m)"
             fg_rays.append({
                 "azimuth_deg": round(az, 1),
+                "bearing_deg": round(az, 1),
                 "cardinal": get_compass_cardinal(az),
                 "vertical_angle_deg": round(best_angle, 2),
+                "target_vertical_angle_deg": round(best_angle, 2),
                 "distance_m": round(d_m, 1),
+                "distance_km": round(d_m / 1000.0, 2),
                 "distance_mi": round(d_m / 1609.344, 2),
-                "elevation_ft": round(e_m * 3.280839895),
-                "elevation_m": round(e_m),
+                "elevation_ft": e_ft_fg,
+                "elevation_m": e_m_fg,
                 "lat": round(p_lat, 5),
                 "lon": round(p_lon, 5),
+                "matched_named_feature": fg_lbl,
+                "matched_feature": fg_lbl,
             })
 
         for i, r in enumerate(fg_rays):
@@ -1643,8 +2388,6 @@ def compute_horizon_skyline(
                     foreground_ridges.append(item)
 
     out = {
-        "visible_features_in_fov": visible_features_in_fov,
-        "occluded_features_in_fov": occluded_features_in_fov,
         "camera": {
             "lat": lat,
             "lon": lon,
@@ -1652,13 +2395,15 @@ def compute_horizon_skyline(
             "elevation_m": cam_m,
         },
         "fov": fov_info,
-        "top_dominant_360_visible_summits": top_dominant_360,
-        "foreground_ridges": foreground_ridges,
-        "dem_horizon_highpoints": horizon_peaks,
-        "named_features_visibility": named_results,
     }
     if checked_coords_visibility:
         out["checked_coords_visibility"] = checked_coords_visibility
+    out["visible_features_in_fov"] = visible_features_in_fov
+    out["dem_horizon_highpoints"] = horizon_peaks
+    out["foreground_ridges"] = foreground_ridges
+    out["top_dominant_360_visible_summits"] = top_dominant_360
+    out["occluded_features_in_fov"] = occluded_features_in_fov
+    out["named_features_visibility"] = named_results
     return out
 
 
@@ -2113,13 +2858,332 @@ def format_compact_json(data, indent_level=0):
         return json.dumps(data, ensure_ascii=False)
 
 
-def _emit_json(data, out_json_path=None):
-    formatted = format_compact_json(data)
+def _emit_json(data, out_json_path=None, stdout_data=None):
+    formatted_full = format_compact_json(data)
     if out_json_path:
         os.makedirs(os.path.dirname(os.path.abspath(out_json_path)), exist_ok=True)
         with open(out_json_path, "w", encoding="utf-8") as f:
-            f.write(formatted + "\n")
-    print(formatted, flush=True)
+            f.write(formatted_full + "\n")
+    if stdout_data is not None:
+        print(format_compact_json(stdout_data), flush=True)
+    else:
+        print(formatted_full, flush=True)
+
+
+def _filter_feature_list(
+    features,
+    types=None,
+    az_min=None,
+    az_max=None,
+    max_dist_mi=None,
+    max_dist_km=None,
+    search=None,
+    max_results=None,
+):
+    if not features:
+        return []
+    allowed_types = None
+    if types:
+        raw_types = [t.strip().lower() for t in str(types).split(",") if t.strip()]
+        expanded = set(raw_types)
+        if "peak" in expanded or "summit" in expanded:
+            expanded.update(("peak", "summit"))
+        if "pass" in expanded or "col" in expanded or "gap" in expanded or "saddle" in expanded:
+            expanded.update(("pass", "col", "gap", "saddle"))
+        if "tarn" in expanded or "water" in expanded or "lake" in expanded or "pond" in expanded:
+            expanded.update(("tarn", "water", "lake", "pond"))
+        allowed_types = expanded
+
+    search_terms = None
+    if search:
+        search_terms = [s.strip().lower() for s in str(search).split(",") if s.strip()]
+
+    out = []
+    for f in features:
+        if allowed_types is not None:
+            f_type = str(f.get("type") or "").strip().lower()
+            if f_type not in allowed_types:
+                continue
+        b = f.get("bearing_deg")
+        if b is None:
+            b = f.get("azimuth_deg")
+        if b is not None and (az_min is not None or az_max is not None):
+            b_val = float(b) % 360.0
+            if az_min is not None and az_max is not None:
+                a_min = float(az_min) % 360.0
+                a_max = float(az_max) % 360.0
+                if a_min <= a_max:
+                    if not (a_min <= b_val <= a_max):
+                        continue
+                else:
+                    if not (b_val >= a_min or b_val <= a_max):
+                        continue
+            elif az_min is not None:
+                if b_val < float(az_min):
+                    continue
+            elif az_max is not None:
+                if b_val > float(az_max):
+                    continue
+        if max_dist_mi is not None:
+            d_mi = f.get("distance_mi")
+            if d_mi is not None and float(d_mi) > float(max_dist_mi):
+                continue
+        if max_dist_km is not None:
+            d_km = f.get("distance_km")
+            if d_km is None and f.get("distance_mi") is not None:
+                d_km = float(f["distance_mi"]) * 1.609344
+            if d_km is not None and float(d_km) > float(max_dist_km):
+                continue
+        if search_terms:
+            haystack = " ".join(
+                str(f.get(k) or "")
+                for k in ("name", "matched_named_feature", "nearest_named_feature", "type")
+            ).lower()
+            if not any(term in haystack for term in search_terms):
+                continue
+        out.append(f)
+
+    if max_results is not None and int(max_results) > 0:
+        out = out[: int(max_results)]
+    return out
+
+
+def _reorder_skyline_dict(res):
+    ordered_keys = (
+        "camera",
+        "fov",
+        "checked_coords_visibility",
+        "visible_features_in_fov",
+        "dem_horizon_highpoints",
+        "foreground_ridges",
+        "top_dominant_360_visible_summits",
+        "synthetic_pano",
+        "occluded_features_in_fov",
+        "named_features_visibility",
+    )
+    out = {}
+    for k in ordered_keys:
+        if k in res:
+            out[k] = res[k]
+    for k, v in res.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
+def _build_skyline_stdout(res, out_json_path=None, verbose=False):
+    if not out_json_path or verbose:
+        return res
+
+    fov_info = res.get("fov")
+    center_az = fov_info.get("center_azimuth_deg") if isinstance(fov_info, dict) else None
+    hfov_deg = fov_info.get("hfov_deg", 54.4) if isinstance(fov_info, dict) else 54.4
+
+    all_occ = res.get("occluded_features_in_fov", [])
+    if center_az is not None:
+        fov_plus_10 = [
+            o for o in all_occ
+            if abs(angular_diff_signed(o.get("bearing_deg", 0.0), center_az)) <= (hfov_deg / 2.0 + 10.0)
+            or o.get("line_of_sight") == "CENTROID_OCCLUDED_BY_RIM_OR_FORESHORTENING"
+        ]
+    else:
+        fov_plus_10 = list(all_occ)
+
+    # Pick up to 12 closest / highest occluded features within FOV +/- 10 deg
+    centroid_occ = [o for o in fov_plus_10 if o.get("line_of_sight") == "CENTROID_OCCLUDED_BY_RIM_OR_FORESHORTENING"]
+    by_closest = sorted(fov_plus_10, key=lambda o: o.get("distance_mi") if o.get("distance_mi") is not None else 999.0)
+    by_highest = sorted(fov_plus_10, key=lambda o: o.get("elevation_ft") or 0, reverse=True)
+
+    picked_occ = []
+    seen_occ = set()
+    for cand in centroid_occ + by_closest[:6] + by_highest[:6] + by_closest:
+        if len(picked_occ) >= 12:
+            break
+        key = (cand.get("name"), cand.get("bearing_deg"))
+        if key not in seen_occ:
+            seen_occ.add(key)
+            picked_occ.append(cand)
+
+    if center_az is not None:
+        picked_occ.sort(key=lambda x: angular_diff_signed(x.get("bearing_deg", 0.0), center_az))
+    else:
+        picked_occ.sort(key=lambda x: x.get("bearing_deg", 0.0))
+
+    def _compact_dict(item, level):
+        if level <= 0:
+            return item
+        if level == 1:
+            drop = {
+                "geometry_type", "expected_x_px", "projected_x_px", "source",
+                "lat", "lon", "horizon_distance_mi", "horizon_distance_km",
+                "horizon_elevation_ft", "horizon_elevation_m", "occluding_lat", "occluding_lon",
+            }
+            return {k: v for k, v in item.items() if k not in drop}
+        # level == 2: compact stdout representation (full fields + aliases remain in --out-json)
+        if level == 2:
+            keep_order = (
+                "name", "type", "bearing_deg", "azimuth_deg", "cardinal",
+                "distance_mi", "elevation_ft", "target_vertical_angle_deg",
+                "in_fov", "projected_x_fraction", "line_of_sight", "occluding_feature",
+                "matched_named_feature", "nearest_named_feature",
+            )
+            out_d = {}
+            for k in keep_order:
+                if k in item and item[k] is not None:
+                    if k == "azimuth_deg" and "bearing_deg" in out_d:
+                        continue
+                    if k == "line_of_sight" and item[k] == "VISIBLE":
+                        continue
+                    out_d[k] = item[k]
+            return out_d
+        # level >= 3: tightest stdout representation to guarantee < 4.5 KB
+        keep_order_tight = (
+            "name", "type", "bearing_deg", "azimuth_deg",
+            "distance_mi", "elevation_ft", "target_vertical_angle_deg",
+            "in_fov", "projected_x_fraction", "occluding_feature",
+            "matched_named_feature", "nearest_named_feature",
+        )
+        out_d = {}
+        for k in keep_order_tight:
+            if k in item and item[k] is not None:
+                if k == "azimuth_deg" and "bearing_deg" in out_d:
+                    continue
+                out_d[k] = item[k]
+        return out_d
+
+    def _assemble(occ_slice, top360_slice, level=0, max_vis=None, max_hp=None, max_fg=None):
+        vis_raw = res.get("visible_features_in_fov", [])
+        hp_raw = res.get("dem_horizon_highpoints", [])
+        fg_raw = res.get("foreground_ridges", [])
+        if max_vis is not None and len(vis_raw) > max_vis:
+            in_fov_vis = [x for x in vis_raw if x.get("in_fov")]
+            out_fov_vis = [x for x in vis_raw if not x.get("in_fov")]
+            vis_raw = (in_fov_vis + out_fov_vis)[:max_vis]
+        if max_hp is not None and len(hp_raw) > max_hp:
+            in_fov_hp = [x for x in hp_raw if x.get("in_fov")]
+            out_fov_hp = [x for x in hp_raw if not x.get("in_fov")]
+            hp_raw = (in_fov_hp + out_fov_hp)[:max_hp]
+        if max_fg is not None and len(fg_raw) > max_fg:
+            fg_raw = fg_raw[:max_fg]
+
+        vis_list = [_compact_dict(item, level) for item in vis_raw]
+        hp_list = [_compact_dict(item, level) for item in hp_raw]
+        fg_list = [_compact_dict(item, level) for item in fg_raw]
+        occ_list = [_compact_dict(item, level) for item in occ_slice]
+        top360_list = [_compact_dict(item, level) for item in top360_slice]
+
+        out_stdout = {
+            "camera": res.get("camera"),
+            "fov": res.get("fov"),
+        }
+        if "checked_coords_visibility" in res:
+            out_stdout["checked_coords_visibility"] = res["checked_coords_visibility"]
+        out_stdout["visible_features_in_fov"] = vis_list
+        out_stdout["dem_horizon_highpoints"] = hp_list
+        out_stdout["foreground_ridges"] = fg_list
+        out_stdout["top_dominant_360_visible_summits"] = top360_list
+        if "synthetic_pano" in res:
+            out_stdout["synthetic_pano"] = res["synthetic_pano"]
+        out_stdout["occluded_in_fov_total_count"] = len(all_occ)
+        out_stdout["occluded_features_in_fov"] = occ_list
+        return out_stdout
+
+    top360_full = res.get("top_dominant_360_visible_summits", [])
+    for occ_n, top_n, lvl, mv, mhp, mfg in (
+        (12, len(top360_full), 0, None, None, None),
+        (12, 8, 1, None, None, None),
+        (12, 6, 2, None, None, None),
+        (8, 5, 2, None, None, None),
+        (6, 5, 3, None, None, None),
+        (4, 4, 3, None, None, None),
+        (4, 4, 3, 12, 10, 5),
+        (3, 3, 3, 9, 7, 4),
+        (2, 2, 3, 7, 5, 3),
+        (1, 2, 3, 6, 4, 2),
+    ):
+        cand_stdout = _assemble(
+            picked_occ[:occ_n],
+            top360_full[:top_n],
+            level=lvl,
+            max_vis=mv,
+            max_hp=mhp,
+            max_fg=mfg,
+        )
+        if len(format_compact_json(cand_stdout)) <= 4450:
+            return cand_stdout
+    return cand_stdout
+
+
+def _build_nearby_stdout(full_features, filtered_features, out_json_path=None, verbose=False, has_explicit_filters=False):
+    if not out_json_path or verbose:
+        return filtered_features
+
+    major_types = {
+        "Summit", "Lake", "Gap", "Saddle", "Ridge", "Basin", "Valley",
+        "Cliff", "Pillar", "Falls", "Glacier", "Range", "Arch", "Crater",
+    }
+    if has_explicit_filters:
+        retained = list(filtered_features)
+    else:
+        retained = [
+            f for f in filtered_features
+            if float(f.get("distance_km", 999.0)) <= 5.0 or f.get("type") in major_types
+        ]
+
+    def _make_summary(feat_slice, strip_source=False, round_coords=False, compact_keys=False):
+        items = []
+        for item in feat_slice:
+            if compact_keys:
+                keep = ("name", "type", "distance_mi", "distance_km", "bearing_deg", "cardinal", "elevation_ft", "elevation_m")
+                d = {k: item[k] for k in keep if k in item and item[k] is not None}
+            else:
+                d = {k: v for k, v in item.items() if (not strip_source or k != "source")}
+                if round_coords:
+                    if d.get("lat") is not None:
+                        d["lat"] = round(float(d["lat"]), 4)
+                    if d.get("lon") is not None:
+                        d["lon"] = round(float(d["lon"]), 4)
+            items.append(d)
+        return {
+            "out_json": os.path.abspath(out_json_path),
+            "total_features_written_to_file": len(full_features),
+            "stdout_features_shown": len(items),
+            "features": items,
+        }
+
+    summary = _make_summary(retained, strip_source=False)
+    if len(format_compact_json(summary)) <= 5450:
+        return summary
+
+    # Strip redundant "source" key and round coords on stdout copy
+    summary = _make_summary(retained, strip_source=True, round_coords=True)
+    if len(format_compact_json(summary)) <= 5450:
+        return summary
+
+    # Prioritize closest features (<= 3.0 km), unnamed tarns (<= 1.5 km), and diverse major landforms across the basin
+    within_3km = [f for f in retained if float(f.get("distance_km", 999.0)) <= 3.0]
+    beyond_3km = [f for f in retained if float(f.get("distance_km", 999.0)) > 3.0]
+    priority_types = {"Gap", "Saddle", "Ridge", "Basin", "Valley", "Cliff", "Pillar"}
+    beyond_3km.sort(
+        key=lambda f: (
+            0 if f.get("type") in priority_types else (
+                1 if (f.get("type") == "Summit" and (f.get("elevation_ft") or 0) >= 12500) else (
+                    2 if f.get("type") == "Lake" and not f.get("is_unnamed_water") else 3
+                )
+            ),
+            float(f.get("distance_km", 99.0)),
+            -(f.get("elevation_ft") or 0),
+        )
+    )
+    prioritized = within_3km + beyond_3km
+
+    for compact_flag in (False, True):
+        for cap in (40, 34, 30, 26, 22, 18):
+            sliced = sorted(prioritized[:cap], key=lambda x: x.get("distance_km", 0.0))
+            summary = _make_summary(sliced, strip_source=True, round_coords=True, compact_keys=compact_flag)
+            if len(format_compact_json(summary)) <= 5450:
+                return summary
+    return summary
 
 
 def main():
@@ -2147,14 +3211,39 @@ def main():
     # Subcommand: calibrate-azimuth
     cal_parser = subparsers.add_parser(
         "calibrate-azimuth",
-        help="Solve for exact camera center_azimuth_deg, left_edge_deg, and right_edge_deg from 1+ anchor bearings and x_fractions.",
+        help="Solve for exact camera center_azimuth_deg, left_edge_deg, and right_edge_deg from 1+ anchor bearings and x_fractions, or project x_frac/bearings from --center-az.",
     )
-    cal_parser.add_argument("--hfov-deg", "--fov", dest="hfov_deg", type=float, required=True, help="Horizontal FOV in degrees")
+    cal_parser.add_argument("--hfov-deg", "--fov-deg", "--fov", dest="hfov_deg", type=float, required=True, help="Horizontal FOV in degrees")
     cal_parser.add_argument(
         "--anchor",
         action="append",
-        required=True,
-        help="Anchor specification 'bearing_deg:x_fraction' or 'bearing_deg,x_fraction' (e.g. --anchor 290.1:0.75); may be passed multiple times",
+        required=False,
+        default=None,
+        help="Anchor specification 'bearing_deg:x_fraction', 'Name:bearing_deg:x_fraction', or 'bearing_deg,x_fraction' (e.g. --anchor 290.1:0.75); may be passed multiple times",
+    )
+    cal_parser.add_argument(
+        "--center-az",
+        "--azimuth",
+        dest="center_az",
+        type=float,
+        default=None,
+        help="Camera center azimuth in degrees (when projecting --x-frac or --project-bearings without --anchor)",
+    )
+    cal_parser.add_argument(
+        "--x-frac",
+        "--x-fraction",
+        dest="x_frac",
+        action="append",
+        default=None,
+        help="Comma-separated x_fraction values (0.0=left, 0.5=center, 1.0=right) to forward-project to compass bearings (e.g. --x-frac 0.10,0.57,0.70)",
+    )
+    cal_parser.add_argument(
+        "--project-bearings",
+        "--bearings",
+        dest="project_bearings",
+        action="append",
+        default=None,
+        help="Comma-separated bearings or 'Name:bearing' pairs to project into x_fraction space (e.g. --project-bearings 73.2,109.0 or 'PeakA:73.2,PeakB:109.0')",
     )
     cal_parser.add_argument(
         "--projection",
@@ -2178,15 +3267,28 @@ def main():
     peaks_parser.add_argument("lat", type=float, help="Latitude")
     peaks_parser.add_argument("lon", type=float, help="Longitude")
     peaks_parser.add_argument("--radius-km", type=float, default=12.0, help="Search radius in kilometers (default: 12.0)")
-    peaks_parser.add_argument("--verbose", action="store_true", help="Include distant (>5km) minor stream mouths")
-    peaks_parser.add_argument("--out-json", "--json-out", dest="out_json", default=None, help="Optional file path to write JSON output")
+    peaks_parser.add_argument("--types", default=None, help="Case-insensitive comma-separated feature class filter (e.g. Lake,Summit,Gap,Ridge,Basin)")
+    peaks_parser.add_argument("--az-min", type=float, default=None, help="Minimum bearing filter in degrees (handles 360 wrap-around when > --az-max)")
+    peaks_parser.add_argument("--az-max", type=float, default=None, help="Maximum bearing filter in degrees")
+    peaks_parser.add_argument("--max-dist-mi", type=float, default=None, help="Maximum distance filter in miles")
+    peaks_parser.add_argument("--max-dist-km", type=float, default=None, help="Maximum distance filter in kilometers")
+    peaks_parser.add_argument("--search", default=None, help="Case-insensitive comma-separated substring filter on feature names")
+    peaks_parser.add_argument("--max-results", type=int, default=None, help="Maximum number of results to print")
+    peaks_parser.add_argument("--verbose", action="store_true", help="Include distant (>5km) minor stream/flat/bench features and disable stdout compaction")
+    peaks_parser.add_argument("--out-json", "--json-out", dest="out_json", default=None, help="Optional file path to write full unfiltered JSON output")
 
     # Subcommand: elevation-profile
-    prof_parser = subparsers.add_parser("elevation-profile", help="Check line-of-sight occlusion and elevation profile between camera and target.")
+    prof_parser = subparsers.add_parser(
+        "elevation-profile",
+        help="Check line-of-sight occlusion and elevation profile between camera and target (by lat2/lon2 or --bearing-deg + --dist-km/--dist-mi).",
+    )
     prof_parser.add_argument("lat1", type=float, help="Camera latitude")
     prof_parser.add_argument("lon1", type=float, help="Camera longitude")
-    prof_parser.add_argument("lat2", type=float, help="Target latitude")
-    prof_parser.add_argument("lon2", type=float, help="Target longitude")
+    prof_parser.add_argument("lat2", nargs="?", type=float, default=None, help="Target latitude (optional if --bearing-deg and --dist-km/--dist-mi are supplied)")
+    prof_parser.add_argument("lon2", nargs="?", type=float, default=None, help="Target longitude (optional if --bearing-deg and --dist-km/--dist-mi are supplied)")
+    prof_parser.add_argument("--bearing-deg", "--bearing", dest="bearing_deg", type=float, default=None, help="Forward ray-tracing compass bearing in degrees")
+    prof_parser.add_argument("--dist-km", type=float, default=None, help="Forward ray-tracing distance in kilometers")
+    prof_parser.add_argument("--dist-mi", type=float, default=None, help="Forward ray-tracing distance in miles")
     prof_parser.add_argument("--samples", "--steps", dest="samples", type=int, default=40, help="Number of sample intervals along ray (default: 40)")
     prof_parser.add_argument("--full-profile", action="store_true", help="Include full step-by-step elevation array in JSON output")
     prof_parser.add_argument("--out-json", "--json-out", dest="out_json", default=None, help="Optional file path to write JSON output")
@@ -2203,7 +3305,7 @@ def main():
     sky_parser.add_argument("--az-max", type=float, default=360.0, help="Maximum azimuth in degrees (default: 360.0)")
     sky_parser.add_argument("--az-step", type=float, default=1.0, help="Azimuth step in degrees for DEM ray sweep (default: 1.0)")
     sky_parser.add_argument("--center-az", type=float, default=None, help="Estimated camera center azimuth (degrees) to compute FOV bounds and pixel-X fraction")
-    sky_parser.add_argument("--hfov-deg", "--fov", dest="hfov_deg", type=float, default=54.4, help="Horizontal field of view in degrees (default: 54.4 for 35mm full-frame)")
+    sky_parser.add_argument("--hfov-deg", "--fov-deg", "--fov", dest="hfov_deg", type=float, default=54.4, help="Horizontal field of view in degrees (default: 54.4 for 35mm full-frame)")
     sky_parser.add_argument(
         "--projection",
         choices=["auto", "rectilinear", "cylindrical"],
@@ -2216,6 +3318,11 @@ def main():
         default=None,
         help="Optional 'lat,lon[,label]' target to evaluate in the same DEM pass (may be passed multiple times)",
     )
+    sky_parser.add_argument("--types", default=None, help="Case-insensitive comma-separated feature class filter (e.g. Lake,Summit,Gap,Ridge,Basin)")
+    sky_parser.add_argument("--max-dist-mi", type=float, default=None, help="Maximum feature distance filter in miles")
+    sky_parser.add_argument("--max-dist-km", type=float, default=None, help="Maximum feature distance filter in kilometers")
+    sky_parser.add_argument("--search", default=None, help="Case-insensitive comma-separated substring filter on feature names")
+    sky_parser.add_argument("--verbose", action="store_true", help="Disable stdout compaction when --out-json is used")
     sky_parser.add_argument("--image-width", type=int, default=None, help="Optional image width in pixels to include integer expected_x_px")
     sky_parser.add_argument("--out-pano", default=None, help="Optional PNG path to also render an annotated 2D synthetic DEM panorama (e.g. scratch/281A5933_pano.png)")
     sky_parser.add_argument("--out-json", "--json-out", dest="out_json", default=None, help="Optional file path to write JSON output")
@@ -2232,9 +3339,10 @@ def main():
     pano_parser.add_argument("--az-min", type=float, default=None, help="Minimum azimuth in degrees (default: auto from --center-az or 0)")
     pano_parser.add_argument("--az-max", type=float, default=None, help="Maximum azimuth in degrees (default: auto from --center-az or 360)")
     pano_parser.add_argument("--center-az", "--azimuth", dest="center_az", type=float, default=None, help="Optional camera center azimuth in degrees to draw FOV bounds")
-    pano_parser.add_argument("--hfov-deg", "--fov", dest="hfov_deg", type=float, default=54.4, help="Horizontal field of view in degrees (default: 54.4)")
+    pano_parser.add_argument("--hfov-deg", "--fov-deg", "--fov", dest="hfov_deg", type=float, default=54.4, help="Horizontal field of view in degrees (default: 54.4)")
     pano_parser.add_argument("--alt-min", type=float, default=-15.0, help="Minimum altitude angle in degrees (default: -15.0)")
     pano_parser.add_argument("--alt-max", type=float, default=15.0, help="Maximum altitude angle in degrees (default: 15.0, auto-expands for steep walls)")
+    pano_parser.add_argument("--verbose", action="store_true", help="Include full skyline arrays in stdout even when --out-json is passed")
     pano_parser.add_argument("--out-json", "--json-out", dest="out_json", default=None, help="Optional file path to write JSON output")
 
     # Subcommand: render-topo
@@ -2248,8 +3356,9 @@ def main():
     topo_parser.add_argument("--out", dest="out_opt", default=None, help="Output PNG file path (e.g. scratch/281A5985_topo.png)")
     topo_parser.add_argument("--radius-km", type=float, default=5.0, help="Map half-width radius in kilometers (default: 5.0)")
     topo_parser.add_argument("--center-az", "--azimuth", dest="center_az", type=float, default=None, help="Optional camera center azimuth to draw FOV wedge")
-    topo_parser.add_argument("--hfov-deg", "--fov", dest="hfov_deg", type=float, default=54.4, help="Horizontal FOV in degrees when drawing FOV wedge (default: 54.4)")
+    topo_parser.add_argument("--hfov-deg", "--fov-deg", "--fov", dest="hfov_deg", type=float, default=54.4, help="Horizontal FOV in degrees when drawing FOV wedge (default: 54.4)")
     topo_parser.add_argument("--rays", default=None, help="Optional comma-separated bearing rays in degrees (e.g. '90,180,270')")
+    topo_parser.add_argument("--zoom", type=int, default=None, help="Optional compatibility flag (bounding-box scale is controlled by --radius-km)")
     topo_parser.add_argument("--out-json", "--json-out", dest="out_json", default=None, help="Optional file path to write JSON output")
 
     args = parser.parse_args()
@@ -2290,8 +3399,18 @@ def main():
         _emit_json(res, args.out_json)
 
     elif args.command == "calibrate-azimuth":
+        if not args.anchor and args.center_az is None:
+            sys.stderr.write("error: calibrate-azimuth requires at least one of --anchor or --center-az\n")
+            sys.exit(2)
         try:
-            res = calibrate_azimuth(args.hfov_deg, args.anchor, projection=args.projection)
+            res = calibrate_azimuth(
+                args.hfov_deg,
+                anchors=args.anchor,
+                projection=args.projection,
+                center_az=args.center_az,
+                x_fracs=args.x_frac,
+                project_bearings=args.project_bearings,
+            )
         except ValueError as exc:
             sys.stderr.write(f"{exc}\n")
             sys.exit(1)
@@ -2302,17 +3421,59 @@ def main():
         _emit_json(res, args.out_json)
 
     elif args.command == "nearby-features":
-        features = find_nearby_features(args.lat, args.lon, args.radius_km, verbose=args.verbose)
-        _emit_json(features, args.out_json)
+        full_features = find_nearby_features(args.lat, args.lon, args.radius_km, verbose=bool(args.verbose or args.out_json))
+        if not args.verbose and not args.out_json:
+            base_features = [
+                f for f in full_features
+                if not (f.get("type") == "Stream" and float(f.get("distance_km", 0.0)) > 5.0)
+            ]
+        else:
+            base_features = full_features
+        has_filters = any(
+            v is not None
+            for v in (args.types, args.az_min, args.az_max, args.max_dist_mi, args.max_dist_km, args.search, args.max_results)
+        )
+        filtered = _filter_feature_list(
+            base_features,
+            types=args.types,
+            az_min=args.az_min,
+            az_max=args.az_max,
+            max_dist_mi=args.max_dist_mi,
+            max_dist_km=args.max_dist_km,
+            search=args.search,
+            max_results=args.max_results,
+        )
+        stdout_payload = _build_nearby_stdout(
+            full_features,
+            filtered,
+            out_json_path=args.out_json,
+            verbose=args.verbose,
+            has_explicit_filters=has_filters,
+        )
+        _emit_json(full_features if args.out_json else filtered, args.out_json, stdout_data=stdout_payload)
 
     elif args.command == "elevation-profile":
+        has_target_coords = (args.lat2 is not None and args.lon2 is not None)
+        has_ray_target = (args.bearing_deg is not None and (args.dist_km is not None or args.dist_mi is not None))
+        if not has_target_coords and not has_ray_target:
+            sys.stderr.write(
+                "error: elevation-profile requires either positional (lat2 lon2) OR (--bearing-deg with --dist-km or --dist-mi)\n"
+            )
+            sys.exit(2)
+        if has_target_coords:
+            tgt_lat, tgt_lon = args.lat2, args.lon2
+            inc_prof = bool(args.full_profile)
+        else:
+            d_km = float(args.dist_km) if args.dist_km is not None else float(args.dist_mi) * 1.609344
+            tgt_lat, tgt_lon = project_coordinate(args.lat1, args.lon1, args.bearing_deg, d_km)
+            inc_prof = True
         res = compute_elevation_profile(
             args.lat1,
             args.lon1,
-            args.lat2,
-            args.lon2,
+            tgt_lat,
+            tgt_lon,
             samples=args.samples,
-            include_profile=args.full_profile,
+            include_profile=inc_prof,
         )
         _emit_json(res, args.out_json)
 
@@ -2344,7 +3505,35 @@ def main():
                 include_skyline_lists=False,
             )
             res["synthetic_pano"] = pano_info
-        _emit_json(res, args.out_json)
+        res = _reorder_skyline_dict(res)
+
+        has_sky_filters = any(v is not None for v in (args.types, args.max_dist_mi, args.max_dist_km, args.search))
+        if has_sky_filters:
+            filtered_res = dict(res)
+            for list_key in ("visible_features_in_fov", "occluded_features_in_fov", "named_features_visibility"):
+                if list_key in filtered_res:
+                    filtered_res[list_key] = _filter_feature_list(
+                        filtered_res[list_key],
+                        types=args.types,
+                        max_dist_mi=args.max_dist_mi,
+                        max_dist_km=args.max_dist_km,
+                        search=args.search,
+                    )
+            if any(v is not None for v in (args.max_dist_mi, args.max_dist_km, args.search)):
+                for dem_key in ("dem_horizon_highpoints", "foreground_ridges"):
+                    if dem_key in filtered_res:
+                        filtered_res[dem_key] = _filter_feature_list(
+                            filtered_res[dem_key],
+                            max_dist_mi=args.max_dist_mi,
+                            max_dist_km=args.max_dist_km,
+                            search=args.search,
+                        )
+            filtered_res = _reorder_skyline_dict(filtered_res)
+        else:
+            filtered_res = res
+
+        stdout_res = _build_skyline_stdout(filtered_res, out_json_path=args.out_json, verbose=args.verbose)
+        _emit_json(res if args.out_json else filtered_res, args.out_json, stdout_data=stdout_res)
 
     elif args.command == "render-pano":
         res = render_synthetic_pano(
@@ -2360,7 +3549,22 @@ def main():
             alt_max=args.alt_max,
             include_skyline_lists=True,
         )
-        _emit_json(res, args.out_json)
+        if args.out_json and not args.verbose:
+            stdout_pano = {
+                "output_path": res.get("output_path"),
+                "out_json": os.path.abspath(args.out_json),
+                "az_start_deg": res.get("az_start_deg"),
+                "az_span_deg": res.get("az_span_deg"),
+                "alt_min_deg": res.get("alt_min_deg"),
+                "alt_max_deg": res.get("alt_max_deg"),
+                "annotated_features_count": res.get("annotated_features_count"),
+                "visible_features_in_fov_count": len(res.get("visible_features_in_fov", [])),
+                "dem_horizon_highpoints_count": len(res.get("dem_horizon_highpoints", [])),
+                "foreground_ridges_count": len(res.get("foreground_ridges", [])),
+            }
+        else:
+            stdout_pano = res
+        _emit_json(res, args.out_json, stdout_data=stdout_pano)
 
     elif args.command == "render-topo":
         out_path = args.out_opt or args.out_pos

@@ -34,6 +34,8 @@ Please double check the draft for factual correctness and flag anything that
 may be inaccurate. Please correct any language mistakes (e.g. spelling,
 grammar, etc.). List all changes you have made for reference.
 
+- **No Premature Photo Directory Probing**: Do **NOT** run `Get-ChildItem`, `dir`, or `Test-Path` to check for `<date>/photos/` during Phase 1 or Phase 2—photos are provided later in Phase 3.
+
 ## Phase 2: Narrative Augmentation
 
 Suggest any additional facts that we might want to incorporate into the post,
@@ -52,8 +54,10 @@ are located in the directory `<date>/photos`.
 
 ### 1. Strict Delegation Boundary & Anti-Amnesia Guardrails
 - **No Parent Photo Analysis**: Do **not** view photos (`read_file`), run `extract_metadata.py` / `crop_photo.py` / `geo_tools.py`, run `Test-Path` checks, or perform independent geographic/flora verification in the main orchestrator agent. Immediately delegate each photo to a `self` subagent running the `photo-analysis` skill, and let the user verify the subagent's output.
-- **Persist the Hike-Specific Subagent Prompt Template to Disk**: At the start of Phase 3 (before spawning the first photo subagent), save your hike-specific subagent prompt template (with the hike's `<workspace>`, `<date>`, and pre-computed `--ref-elev-ft "Label:ElevFt"` benchmark flags filled in) to `<workspace>/scratch/subagent_prompt_template.txt` using `write_file`. Whenever a context compaction occurs during a 30–40 photo session, re-read `<workspace>/scratch/subagent_prompt_template.txt` (or this `SKILL.md` file) so your subagent prompts never degrade or lose the Single-Writer Rule.
-- **No Transcript Scavenging or Inline `python -c` Scripts**: Never read or grep `.system_generated/logs/transcript.jsonl` or `transcript_full.jsonl` after context compaction, and never run inline `python -c` one-liners to parse or update `<date>/catalog.md`. Instead, recover state from `<workspace>/<date>/catalog.md`, `<workspace>/scratch/*_entry.md`, and `catalog_tools.py validate "<workspace>/<date>"`.
+- **Persist the Hike-Specific Subagent Prompt Template & 4-Step Lifecycle Header to Disk**: At the start of Phase 3 (before spawning the first photo subagent), save your hike-specific subagent prompt template (with the hike's `<workspace>`, `<date>`, and pre-computed `--ref-elev-ft "Label:ElevFt"` benchmark flags filled in, plus a comment header summarizing the Parent 4-Step Lifecycle rules below) to `<workspace>/scratch/subagent_prompt_template.txt` using `write_file`.
+- **Post-Compaction Recovery Rules**: If context compaction occurs during Phase 3, immediately re-read **both** `<workspace>/scratch/subagent_prompt_template.txt` **AND** `C:\Users\Tilman\.gemini\config\skills\hiking-blog-post\SKILL.md` (lines 50–100) upon waking so your subagent prompts and Parent 4-Step Lifecycle rules never degrade.
+- **No Per-Photo `validate` Calls in Phase 3**: Do **NOT** run `catalog_tools.py validate` after individual photos in Phase 3—`upsert` already runs entry formatting checks on each photo and returns `formatting_issues` and `normalized_entry`. Run `validate` **ONLY once** in Phase 4 after inserting all `[PHOTO: ...]` tags into `post.md`.
+- **No Transcript Scavenging or Inline `python -c` Scripts**: Never read or grep `.system_generated/logs/transcript.jsonl` or `transcript_full.jsonl` after context compaction, and never run inline `python -c` one-liners to parse or update `<date>/catalog.md`. To check whether the current photo was already upserted before a mid-turn context compaction, run `python C:\Users\Tilman\.gemini\config\skills\hiking-blog-post\scripts\catalog_tools.py status "<workspace>/<date>"`—never inspect `transcript.jsonl`.
 
 ### 2. Canonical Subagent Prompt Template
 Pass this exact prompt structure (filling in `<workspace>`, `<date>`, `<filename>`, `<photo_stem>`, and the hike's `--ref-elev-ft` flags) to `invoke_subagent`:
@@ -69,7 +73,7 @@ Analyze the hiking photo `<workspace>/<date>/photos/<filename>` using the `photo
    - Prefix ALL temporary files saved in `<workspace>/scratch/` with `<photo_stem>_`.
 3. Stage 2 (Narrative Cross-Check & Draft Placement):
    - After establishing your geometric orientation in Stage 1, read `<workspace>/<date>/post.md` to cross-check trail/junction context, test any landmarks mentioned near this segment, and determine the exact `Suggested Draft Placement`.
-4. SINGLE-WRITER RULE: Do NOT read, grep, or modify `<workspace>/<date>/catalog.md`. Format your output strictly using the 4-bullet `## Output Format` template in `photo-analysis/SKILL.md`, save a copy to `<workspace>/scratch/<photo_stem>_entry.md` using `write_file` (`Overwrite: true`), and output the exact same markdown block in your final response.
+4. SINGLE-WRITER RULE: Do NOT read, grep, or modify `<workspace>/<date>/catalog.md`. Format your output strictly using the 4-bullet `## Output Format` template in `photo-analysis/SKILL.md`. Write your complete markdown entry (`### Photo: \`<filename>\`` through `### Suggested Draft Placement`) to `<workspace>/scratch/<photo_stem>_entry.md` using `write_file` (`Overwrite: true`), send the file path and complete markdown entry **once** to the parent agent via `send_message`, and end your final response with a 1-sentence confirmation without repeating the markdown block.
 ```
 
 ### 3. 4-Step Per-Photo Lifecycle & Subagent Reuse Protocol
@@ -80,8 +84,8 @@ For each photo `$N$` provided by the user, follow this exact 4-step lifecycle:
   ```bash
   python C:\Users\Tilman\.gemini\config\skills\hiking-blog-post\scripts\catalog_tools.py upsert "<workspace>/<date>/catalog.md" "<workspace>/scratch/<photo_stem>_entry.md"
   ```
-  Then present the subagent's analysis directly to the user **without** performing any independent photo viewing, metadata extraction, or verification in the parent agent.
-- **Step C (User Corrections via `send_message` + Re-Upsert)**: If the user questions or corrects the analysis of Photo `$N$`, relay the user's feedback to the existing idle subagent via `send_message(Recipient="<subagent_conversation_id>", Message="...")` (remind it to update `<workspace>/scratch/<photo_stem>_entry.md` and return the full revised markdown block) instead of spawning a new subagent or analyzing the photo in the parent. When the subagent replies with its revised analysis, re-run `catalog_tools.py upsert` to update `<workspace>/<date>/catalog.md` in place.
+  Do **not** read or edit `<workspace>/scratch/<photo_stem>_entry.md` from the parent agent (unless `upsert` reports non-empty `formatting_issues`), and do **not** run `catalog_tools.py validate` during Phase 3. Present the normalized entry directly to the user **without** performing any independent photo viewing, metadata extraction, or verification in the parent agent.
+- **Step C (User Corrections via `send_message` + Re-Upsert)**: If the user questions or corrects the analysis of Photo `$N$`, relay the user's feedback to the existing idle subagent via `send_message(Recipient="<subagent_conversation_id>", Message="...")` (remind it to update `<workspace>/scratch/<photo_stem>_entry.md`, send the revised markdown entry **once** via `send_message`, and end its final response with a 1-sentence confirmation) instead of spawning a new subagent or analyzing the photo in the parent. When the subagent replies with its revised analysis, re-run `catalog_tools.py upsert` to update `<workspace>/<date>/catalog.md` in place.
 - **Step D (Zero-Overhead Idle Subagent Retention)**: Because a completed subagent is already idle (`DONE`) and consumes zero compute resources, do **not** call `manage_subagents(Action="kill")` after each photo. Leaving completed subagents idle avoids unnecessary tool calls and allows re-messaging Photo `$N$`'s subagent at any point (even if the user spots a discrepancy after moving on to Photo `$N+1$`).
 
 ## Phase 4: Synthesis and Final Insertion
@@ -90,6 +94,14 @@ Once all photos are analyzed, use the information in `<date>/catalog.md` to
 update the narrative in the draft. Identify the right place in the narrative
 for each photo and incorporate the details from the photo into the blog post.
 You can narrate in the first person if that better fits the overall narrative.
+
+To inspect a compact summary of every cataloged photo's `Location`,
+`Suggested Draft Placement`, and `Suggested Caption` without writing custom
+Python scripts or `python -c` one-liners, run the `placements` subcommand:
+
+```bash
+python C:\Users\Tilman\.gemini\config\skills\hiking-blog-post\scripts\catalog_tools.py placements "<workspace>/<date>"
+```
 
 Also add a placeholder in the blog post where the photo should be placed and
 add the caption from the photo analysis. At the end of the caption, include

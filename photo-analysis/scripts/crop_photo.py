@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import math
+import shutil
 import argparse
 from PIL import Image, ImageDraw, ImageFont
 
@@ -347,7 +348,7 @@ def _downscale_if_needed(img, max_dim):
     return img.resize((new_w, new_h), resample=resample)
 
 
-def _resolve_output_path(photo_path, out_path, tag, multi_output=False):
+def _resolve_output_paths(photo_path, out_path, tag, multi_output=False, label=None):
     base_name = os.path.splitext(os.path.basename(photo_path))[0]
     if not out_path:
         scratch_dir = os.path.join(os.getcwd(), "scratch")
@@ -356,23 +357,49 @@ def _resolve_output_path(photo_path, out_path, tag, multi_output=False):
                 os.makedirs(scratch_dir, exist_ok=True)
             except Exception:
                 scratch_dir = os.getcwd()
-        return os.path.join(scratch_dir, f"{base_name}_{tag}.jpg")
+        target = os.path.join(scratch_dir, f"{base_name}_{tag}.jpg")
+        return target, None, target if label is not None else None
 
     if os.path.isdir(out_path) or out_path.endswith(("/", "\\")):
         os.makedirs(out_path, exist_ok=True)
-        return os.path.join(out_path, f"{base_name}_{tag}.jpg")
+        target = os.path.join(out_path, f"{base_name}_{tag}.jpg")
+        return target, None, target if label is not None else None
 
     parent_dir = os.path.dirname(os.path.abspath(out_path))
     if parent_dir and not os.path.exists(parent_dir):
         os.makedirs(parent_dir, exist_ok=True)
 
-    if not multi_output:
-        return out_path
-
     stem, ext = os.path.splitext(out_path)
     if not ext:
         ext = ".jpg"
-    return f"{stem}_{tag}{ext}"
+
+    if not multi_output:
+        if label is not None:
+            stem_base = os.path.basename(stem)
+            if not stem_base.lower().endswith(f"_{tag.lower()}"):
+                labeled_path = f"{stem}_{tag}{ext}"
+                out_base_lower = os.path.basename(out_path).lower()
+                is_generic = (
+                    out_base_lower in ("_crop.jpg", "_box.jpg", "_crop.png", "_box.png")
+                    or out_base_lower.endswith(("_crop.jpg", "_box.jpg", "_crop.png", "_box.png", "_crop.jpeg", "_box.jpeg"))
+                    or stem_base.lower() == base_name.lower()
+                )
+                if is_generic:
+                    return labeled_path, out_path, labeled_path
+                else:
+                    return out_path, labeled_path, labeled_path
+            return out_path, None, out_path
+        return out_path, None, None
+
+    target = f"{stem}_{tag}{ext}"
+    return target, None, target if label is not None else None
+
+
+def _resolve_output_path(photo_path, out_path, tag, multi_output=False, label=None):
+    target_path, _, _ = _resolve_output_paths(
+        photo_path, out_path, tag, multi_output=multi_output, label=label
+    )
+    return target_path
 
 
 def _save_single_op(img, orig_w, orig_h, photo_path, box, tag, out_path, multi_output=False, max_dim=None, grid=False, label=None):
@@ -386,7 +413,9 @@ def _save_single_op(img, orig_w, orig_h, photo_path, box, tag, out_path, multi_o
     else:
         final_img = cropped
 
-    target_path = _resolve_output_path(photo_path, out_path, tag, multi_output=multi_output)
+    target_path, secondary_path, labeled_path = _resolve_output_paths(
+        photo_path, out_path, tag, multi_output=multi_output, label=label
+    )
     ext = os.path.splitext(target_path)[1].lower()
     if ext in (".jpg", ".jpeg"):
         final_img.save(target_path, quality=92)
@@ -394,6 +423,12 @@ def _save_single_op(img, orig_w, orig_h, photo_path, box, tag, out_path, multi_o
         final_img.save(target_path)
 
     abs_out = os.path.abspath(target_path)
+    abs_secondary = None
+    if secondary_path:
+        abs_secondary = os.path.abspath(secondary_path)
+        if abs_secondary != abs_out:
+            shutil.copyfile(abs_out, abs_secondary)
+
     bx1, by1, bx2, by2 = box
     result = {
         "out_path": abs_out,
@@ -412,6 +447,9 @@ def _save_single_op(img, orig_w, orig_h, photo_path, box, tag, out_path, multi_o
     }
     if label:
         result["label"] = label
+    if labeled_path and secondary_path:
+        result["labeled_out_path"] = os.path.abspath(labeled_path)
+        result["alternate_out_path"] = abs_secondary
     return result
 
 

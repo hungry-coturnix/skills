@@ -2,14 +2,24 @@
 r"""
 Catalog Management & Validation CLI (`catalog_tools.py`) for the `hiking-blog-post` skill.
 
-Provides two primary subcommands:
+Provides four subcommands:
   1. `upsert <catalog_md_path> <entry_md_path>`:
      Reads a per-photo markdown analysis staging file (`<workspace>/scratch/<photo_stem>_entry.md`),
      validates and normalizes its `### Photo: \`<filename>\`` header and section dividers, and
      idempotently inserts or updates the matching entry in `<date>/catalog.md` in chronological
      photo order without loading `catalog.md` into the LLM context window.
 
-  2. `validate <date_dir>`:
+  2. `placements <date_dir>`:
+     Parses `<date_dir>/catalog.md` and outputs a compact one-line-per-photo summary of
+     `Location`, `Suggested Draft Placement`, and `Suggested Caption` for Phase 4 synthesis:
+     `[idx] <photo_name> | Location: <location> | Placement: <placement> | Caption: <caption>`
+
+  3. `status <date_dir>`:
+     Reports lightweight cataloging progress (`cataloged_photos`, `last_cataloged_photo`,
+     `uncataloged_photos`) for post-compaction state recovery in Phase 3 without inspecting
+     `transcript.jsonl` or running full Phase 4 `validate`.
+
+  4. `validate <date_dir>`:
      Scans `<date_dir>/photos/` for `.jpg`/`.jpeg` files, parses `<date_dir>/catalog.md` for
      `### Photo: \`<filename>\`` entries, and parses `<date_dir>/post.md` for
      `[PHOTO: <filename>][CAPTION: ...]` placeholders. Reports a compact JSON summary covering
@@ -40,14 +50,22 @@ CANONICAL_METADATA_BULLETS = [
 ]
 
 PHOTO_HEADER_RE = re.compile(
-    r"^(#{2,4})\s*Photo(?:\s+\d+)?\s*:\s*`?([^`\n\r]+?)`?\s*$",
-    re.MULTILINE,
+    r"^(#{2,4})\s*(?:Photo(?:\s+\d+)?\s*:\s*`?([^`\n\r]+?)`?|(?:\[?\d+\]?\.?)\s*`?([^`\n\r]+?\.(?:jpg|jpeg|png))`?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
 )
 
 DMS_COORD_RE = re.compile(
     r"\d+\s*°\s*\d+\s*['’′]\s*(?:\d+(?:\.\d+)?\s*[\"”″]?\s*)?[NSEWnsew]?"
 )
 TEMP_DEG_RE = re.compile(r"[-+]?\d+(?:\.\d+)?\s*°\s*[FCfc]\b")
+
+# Allow optional first-half imperial range ("9,500 ft to 11,500 ft / ..."),
+# optional "~", optional decimals ("300 ft / 91.4 m"), and "–", "-", "to", "and" range connectors
+SINGLE_FT_RE = re.compile(
+    r"\b(\d{1,2},\d{3}|\d{3,5})\s*ft\b"
+    r"(?!\s*(?:[–-]|to|and)\s*~?\s*[\d,]+\s*ft\b)"
+    r"(?!\s*/\s*~?\s*[\d,]+(?:\.\d+)?(?:\s*(?:[–-]|to|and)\s*~?\s*[\d,]+(?:\.\d+)?)?\s*m\b)"
+)
 
 
 def natural_photo_key(filename: str) -> List[Tuple[int, Any]]:
@@ -105,7 +123,7 @@ def normalize_entry_block(raw_text: str) -> Tuple[str, str]:
             "Entry file does not contain a valid '### Photo: `<filename>`' header."
         )
 
-    raw_filename = match.group(2).strip()
+    raw_filename = (match.group(2) or match.group(3) or "").strip()
     filename = os.path.basename(raw_filename)
     if not filename:
         raise ValueError(f"Could not parse photo filename from header: {match.group(0)!r}")
@@ -174,7 +192,11 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
       - Non-canonical `### Photo: \`<filename>\`` header
       - Forbidden em-dashes (`—`)
       - Extra or missing metadata bullets beyond the 4 canonical bullets
-      - Leaked degree symbols (`°`) in `Identified Natural Features` or `Suggested Caption`
+      - Single-unit `ft` elevations missing `/ YYY m` across the `- **Elevation**:`
+        metadata bullet, `### Identified Natural Features`, `### Identified Fauna & Flora`,
+        and `### Suggested Caption` (excluding `### Suggested Draft Placement`)
+      - Leaked degree symbols (`°`) in `Identified Natural Features`, `Identified Fauna & Flora`,
+        or `Suggested Caption`
       - Missing trailing GPS coordinates in `Suggested Caption`
     """
     issues: List[Dict[str, str]] = []
@@ -217,6 +239,21 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
                 "detail": f"Missing required metadata bullet(s): {missing_bullets}.",
             })
 
+        # Enforce dual-unit elevation check on the `- **Elevation**:` metadata bullet
+        for m_elev in re.finditer(r"(?m)^\s*-\s*\*\*Elevation\*\*\s*:(.*)$", meta_block):
+            elev_val = m_elev.group(1)
+            for m_ft in SINGLE_FT_RE.finditer(elev_val):
+                snippet = re.sub(
+                    r"\s+",
+                    " ",
+                    elev_val[max(0, m_ft.start() - 20): min(len(elev_val), m_ft.end() + 25)],
+                ).strip()
+                issues.append({
+                    "source": f"catalog.md ({filename} -> Elevation)",
+                    "type": "missing_dual_elevation_units",
+                    "detail": f"Elevation in feet missing '/ YYY m' conversion near: '{snippet}'",
+                })
+
     for part in parts[2:]:
         lines = part.splitlines()
         if not lines:
@@ -225,7 +262,27 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
         sec_body = "\n".join(lines[1:]).strip()
         sec_lower = sec_title.lower()
 
-        if "identified natural features" in sec_lower or "suggested caption" in sec_lower:
+        is_draft_placement = "suggested draft placement" in sec_lower
+        is_checked_section = not is_draft_placement and (
+            "identified natural features" in sec_lower
+            or "identified fauna" in sec_lower
+            or "suggested caption" in sec_lower
+        )
+
+        if is_checked_section:
+            for m_ft in SINGLE_FT_RE.finditer(sec_body):
+                snippet = re.sub(
+                    r"\s+",
+                    " ",
+                    sec_body[max(0, m_ft.start() - 20): min(len(sec_body), m_ft.end() + 25)],
+                ).strip()
+                issues.append({
+                    "source": f"catalog.md ({filename} -> {sec_title})",
+                    "type": "missing_dual_elevation_units",
+                    "detail": f"Elevation in feet missing '/ YYY m' conversion near: '{snippet}'",
+                })
+
+        if "identified natural features" in sec_lower or "identified fauna" in sec_lower or "suggested caption" in sec_lower:
             leaked = find_leaked_degree_symbols(sec_body)
             if leaked:
                 issues.append({
@@ -246,6 +303,47 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
                 })
 
     return issues
+
+
+def extract_entry_summary_fields(entry_text: str) -> Dict[str, str]:
+    """
+    Extracts single-line `location`, `placement`, and `caption` fields from a
+    normalized catalog entry block for Phase 4 synthesis (`placements`).
+    """
+    location = ""
+    placement = ""
+    caption = ""
+
+    parts = re.split(r"(?m)^###\s+", entry_text)
+    if len(parts) >= 2:
+        meta_block = parts[1]
+        m_loc = re.search(r"(?m)^\s*-\s*\*\*Location\*\*\s*:\s*(.+)$", meta_block)
+        if m_loc:
+            location = re.sub(r"\s+", " ", m_loc.group(1)).strip()
+
+    for part in parts[2:]:
+        lines = part.splitlines()
+        if not lines:
+            continue
+        sec_title = lines[0].strip().lower()
+        sec_body = re.sub(r"\s+", " ", "\n".join(lines[1:])).strip()
+        if "suggested draft placement" in sec_title:
+            placement = sec_body
+        elif "suggested caption" in sec_title:
+            caption = sec_body
+
+    return {
+        "location": location,
+        "placement": placement,
+        "caption": caption,
+    }
+
+
+def _resolve_date_dir_and_catalog(path_arg: str) -> Tuple[Path, Path]:
+    p = Path(path_arg)
+    if p.is_file() or p.name.lower().endswith(".md"):
+        return p.parent, p
+    return p, p / "catalog.md"
 
 
 def cmd_upsert(args: argparse.Namespace) -> None:
@@ -305,10 +403,10 @@ def cmd_upsert(args: argparse.Namespace) -> None:
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     body_str = "\n\n---\n\n".join(text for _, text in dedup_entries)
     final_catalog_text = f"{preamble.strip()}\n\n{body_str}\n"
-    catalog_path.write_text(final_catalog_text, encoding="utf-8")
+    catalog_path.write_text(final_catalog_text, encoding="utf-8", newline="\n")
 
-    # Also normalize the staging file in place so it always has the canonical header
-    entry_path.write_text(normalized_entry + "\n", encoding="utf-8")
+    # Also normalize the staging file in place so it always has the canonical header and LF line endings
+    entry_path.write_text(normalized_entry + "\n", encoding="utf-8", newline="\n")
 
     entry_issues = inspect_entry_formatting(target_fn, normalized_entry)
     result: Dict[str, Any] = {
@@ -316,11 +414,92 @@ def cmd_upsert(args: argparse.Namespace) -> None:
         "photo": target_fn,
         "catalog_path": str(catalog_path),
         "total_cataloged_photos": len(dedup_entries),
+        "next_step_reminder": (
+            "Present the entry to the user now. Do NOT read/edit the staging file "
+            "or run 'validate' until all photos are cataloged and placed in post.md (Phase 4)."
+        ),
+        "normalized_entry": normalized_entry,
     }
     if entry_issues:
         result["formatting_issues"] = entry_issues
 
     print(json.dumps(result, ensure_ascii=False))
+
+
+def cmd_placements(args: argparse.Namespace) -> None:
+    _, catalog_path = _resolve_date_dir_and_catalog(args.date_dir)
+    if not catalog_path.exists():
+        print(
+            json.dumps({
+                "status": "error",
+                "error": f"Catalog file not found at {catalog_path}",
+            }),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _, parsed_entries = parse_catalog_file(catalog_path)
+    items: List[Dict[str, Any]] = []
+    lines_out: List[str] = []
+    for idx, (fn, norm_text, _) in enumerate(parsed_entries, 1):
+        fields = extract_entry_summary_fields(norm_text)
+        loc = fields["location"]
+        place = fields["placement"]
+        cap = fields["caption"]
+        items.append({
+            "index": idx,
+            "photo": fn,
+            "location": loc,
+            "placement": place,
+            "caption": cap,
+        })
+        lines_out.append(
+            f"[{idx}] {fn} | Location: {loc} | Placement: {place} | Caption: {cap}"
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+    else:
+        print("\n".join(lines_out))
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    date_dir, catalog_path = _resolve_date_dir_and_catalog(args.date_dir)
+    photos_dir = date_dir / "photos"
+    post_path = date_dir / "post.md"
+
+    folder_photos: List[str] = []
+    if photos_dir.exists() and photos_dir.is_dir():
+        for p in photos_dir.iterdir():
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg"):
+                folder_photos.append(p.name)
+        folder_photos.sort(key=natural_photo_key)
+
+    cataloged_photos: List[str] = []
+    if catalog_path.exists():
+        _, parsed_entries = parse_catalog_file(catalog_path)
+        cataloged_photos = [fn for fn, _, _ in parsed_entries]
+
+    cataloged_set = set(cataloged_photos)
+    uncataloged_photos = [fn for fn in folder_photos if fn not in cataloged_set]
+
+    placed_photos: List[str] = []
+    if post_path.exists():
+        post_text = post_path.read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(r"\[PHOTO:\s*`?([^\]`\s]+?)`?\s*\]", post_text):
+            placed_photos.append(os.path.basename(m.group(1).strip()))
+
+    status_payload = {
+        "date_dir": str(date_dir),
+        "catalog_path": str(catalog_path),
+        "total_photos_in_folder": len(folder_photos),
+        "cataloged_count": len(cataloged_photos),
+        "last_cataloged_photo": cataloged_photos[-1] if cataloged_photos else None,
+        "cataloged_photos": cataloged_photos,
+        "uncataloged_photos": uncataloged_photos,
+        "placed_in_post_count": len(set(placed_photos)),
+    }
+    print(json.dumps(status_payload, ensure_ascii=False, indent=2))
 
 
 def cmd_validate(args: argparse.Namespace) -> None:
@@ -417,7 +596,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
                 })
 
         # Check for single-unit elevations (e.g. `11,425 ft` not followed by `/ ... m`)
-        for m in re.finditer(r"\b(\d{1,2},\d{3}|\d{3,5})\s*ft\b(?!\s*/\s*[\d,]+\s*m\b)", post_text):
+        for m in SINGLE_FT_RE.finditer(post_text):
             snippet = re.sub(r"\s+", " ", post_text[max(0, m.start() - 20): min(len(post_text), m.end() + 25)]).strip()
             formatting_issues.append({
                 "source": "post.md",
@@ -487,6 +666,19 @@ def main() -> None:
     p_upsert.add_argument("catalog_md_path", help="Path to <date>/catalog.md")
     p_upsert.add_argument("entry_md_path", help="Path to <workspace>/scratch/<photo_stem>_entry.md")
 
+    p_place = subparsers.add_parser(
+        "placements",
+        help="Output a compact summary of Location, Suggested Draft Placement, and Suggested Caption for Phase 4 synthesis.",
+    )
+    p_place.add_argument("date_dir", help="Path to <date> directory (or <date>/catalog.md)")
+    p_place.add_argument("--json", action="store_true", help="Output structured JSON instead of compact lines")
+
+    p_status = subparsers.add_parser(
+        "status",
+        help="Report lightweight cataloging progress for post-compaction state recovery in Phase 3.",
+    )
+    p_status.add_argument("date_dir", help="Path to <date> directory (or <date>/catalog.md)")
+
     p_val = subparsers.add_parser(
         "validate",
         help="Validate 1:1 photo coverage and formatting across <date>/photos, catalog.md, and post.md.",
@@ -496,6 +688,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.subcommand == "upsert":
         cmd_upsert(args)
+    elif args.subcommand == "placements":
+        cmd_placements(args)
+    elif args.subcommand == "status":
+        cmd_status(args)
     elif args.subcommand == "validate":
         cmd_validate(args)
 
