@@ -34,17 +34,21 @@ Please double check the draft for factual correctness and flag anything that
 may be inaccurate. Please correct any language mistakes (e.g. spelling,
 grammar, etc.). List all changes you have made for reference.
 
-- **No Premature Photo Directory Probing**: Do **NOT** run `Get-ChildItem`, `dir`, or `Test-Path` to check for `<date>/photos/` during Phase 1 or Phase 2—photos are provided later in Phase 3.
+- **Immediate Disk Persistence First (`write_file` Before Any Research)**: Your **very first tool call** in Phase 1 (immediately after reading `SKILL.md`) MUST be `write_file` to persist the proofed draft (with language fixes and dual-unit conversions applied) to `<workspace>/<date>/post.md`. Do **NOT** run `Get-ChildItem`, `read_file` on past `<YYYY-MM-DD>/post.md` files, or `search_web` before `<date>/post.md` is saved to disk. If subsequent Phase 1 fact-checking uncovers a factual correction that should be applied directly to the draft, update `<date>/post.md` inline via `edit_file`.
+- **No Premature Current-Hike Directory Probing**: Do **NOT** run `Get-ChildItem`, `dir`, or `Test-Path` on `<date>/` or `<date>/photos/` during Phase 1 or Phase 2—`write_file` creates `<date>/post.md` automatically, and photos are provided later in Phase 3. (Listing `<YYYY-MM-DD>` folders in the workspace root during Phase 2 to discover past hikes is permitted *after* `<date>/post.md` has been written.)
 
 ## Phase 2: Narrative Augmentation
 
-Suggest any additional facts that we might want to incorporate into the post,
-for example facts about the history, geography, geology, etc. for natural
-features, or details about the species, evolution, habitat, behavior, etc. for
-references to fauna or flora. Scan existing `<YYYY-MM-DD>/post.md` folders in
-the workspace to identify relevant callbacks to past hikes (avoiding
-duplication while highlighting continuity). Stay strictly within the active
-workspace directory (never scan parent directories `..`).
+After `<date>/post.md` is persisted to disk, suggest any additional facts that
+we might want to incorporate into the post, for example facts about the
+history, geography, geology, etc. for natural features, or details about the
+species, evolution, habitat, behavior, etc. for references to fauna or flora.
+Scan existing `<YYYY-MM-DD>/post.md` folders in the workspace to identify
+relevant callbacks to past hikes (avoiding duplication while highlighting
+continuity). Stay strictly within the active workspace directory (never scan
+parent directories `..`).
+
+- **Focused Web Research (No `site:` Operators or Retry Loops)**: When using `search_web` in Phase 1 or Phase 2, never use restrictive `site:` operators (which can hang and fail with empty responses), and limit research to at most 1–2 queries per landmark or topic—if a detail (such as an exact etymology) is unrecorded after 1–2 searches, move on immediately.
 
 ## Phase 3: Photo Processing
 
