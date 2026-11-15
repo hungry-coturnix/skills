@@ -745,7 +745,9 @@ def main():
             batch_paths = siblings
             try:
                 dir_mtime = os.path.getmtime(photo_dir)
-                cache_dir_key = f"{os.path.normcase(photo_dir)}:{dir_mtime}:{len(siblings)}"
+                max_file_mtime = max((os.path.getmtime(p) for p in siblings), default=0.0)
+                total_size = sum((os.path.getsize(p) for p in siblings), 0)
+                cache_dir_key = f"{os.path.normcase(photo_dir)}:{dir_mtime}:{max_file_mtime}:{total_size}:{len(siblings)}"
             except OSError:
                 pass
 
