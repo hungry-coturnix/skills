@@ -71,9 +71,9 @@ Analyze the hiking photo `<workspace>/<date>/photos/<filename>` using the `photo
 
 1. MANDATORY FIRST STEP: Read `C:\Users\Tilman\.gemini\config\skills\photo-analysis\SKILL.md` in full and follow all instructions, geometric/solar verification guardrails, and output formatting rules before running any other tools.
 2. Stage 1 (Unbiased Geometric Discovery — Before Reading `post.md`):
-   - Run `extract_metadata.py` with the hike's reference elevation benchmarks:
+   - Run `extract_metadata.py` (`BypassSandbox: true`) with the hike's reference elevation benchmarks:
      `python C:\Users\Tilman\.gemini\config\skills\photo-analysis\scripts\extract_metadata.py "<workspace>/<date>/photos/<filename>" --ref-elev-ft "<Label1>:<ElevFt1>" --ref-elev-ft "<Label2>:<ElevFt2>"`
-   - View the photo (`read_file`) and run `geo_tools.py` (`sun-position`, `nearby-features`, `horizon-skyline --out-pano "<workspace>/scratch/<photo_stem>_pano.png" --out-json "<workspace>/scratch/<photo_stem>_skyline.json"`, and `render-topo --out "<workspace>/scratch/<photo_stem>_topo.png"`) and `crop_photo.py` to establish the true physical camera orientation and visible features.
+   - View the photo (`read_file`) and run `geo_tools.py` (`sun-position`, `nearby-features`, `horizon-skyline --out-pano "<workspace>/scratch/<photo_stem>_pano.png" --out-json "<workspace>/scratch/<photo_stem>_skyline.json"`, and `render-topo --out "<workspace>/scratch/<photo_stem>_topo.png"` — always passing `BypassSandbox: true` on the first attempt for `extract_metadata.py` and network-backed `geo_tools.py` subcommands) and `crop_photo.py` to establish the true physical camera orientation and visible features.
    - Prefix ALL temporary files saved in `<workspace>/scratch/` with `<photo_stem>_`.
 3. Stage 2 (Narrative Cross-Check & Draft Placement):
    - After establishing your geometric orientation in Stage 1, read `<workspace>/<date>/post.md` to cross-check trail/junction context, test any landmarks mentioned near this segment, and determine the exact `Suggested Draft Placement`.
