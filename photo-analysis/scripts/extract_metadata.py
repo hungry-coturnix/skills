@@ -506,11 +506,13 @@ def compute_neighbor_vectors(
                 pass
         return None, None
 
-    def build_neighbor(neighbor_tuple, is_prev):
+    def build_neighbor(neighbor_tuple, is_prev, compact_stop=False):
         n_dt, n_name, _, n_exif = neighbor_tuple
-        n_lat = n_exif.get("GPSLatitude")
-        n_lon = n_exif.get("GPSLongitude")
-        n_elev_ft, n_elev_m = sample_neighbor_elev(n_lat, n_lon, n_exif)
+        raw_n_lat = n_exif.get("GPSLatitude")
+        raw_n_lon = n_exif.get("GPSLongitude")
+        n_lat = round(float(raw_n_lat), 6) if raw_n_lat is not None else None
+        n_lon = round(float(raw_n_lon), 6) if raw_n_lon is not None else None
+        n_elev_ft, n_elev_m = sample_neighbor_elev(raw_n_lat, raw_n_lon, n_exif)
 
         elev_change_ft = None
         elev_change_m = None
@@ -528,6 +530,28 @@ def compute_neighbor_vectors(
         if target_dt_obj is not None and n_dt_obj is not None:
             elapsed_min = round(abs((n_dt_obj - target_dt_obj).total_seconds()) / 60.0, 1)
 
+        vec = None
+        if target_lat is not None and target_lon is not None and raw_n_lat is not None and raw_n_lon is not None:
+            if is_prev:
+                vec = calculate_haversine(raw_n_lat, raw_n_lon, target_lat, target_lon)
+            else:
+                vec = calculate_haversine(target_lat, target_lon, raw_n_lat, raw_n_lon)
+
+        if compact_stop:
+            stop_info = {
+                "file": n_name,
+                "lat": round(float(raw_n_lat), 5) if raw_n_lat is not None else None,
+                "lon": round(float(raw_n_lon), 5) if raw_n_lon is not None else None,
+                "elev_ft": n_elev_ft,
+                "dz_ft": elev_change_ft,
+                "dt_min": elapsed_min,
+            }
+            if vec is not None:
+                stop_info["dist_m"] = vec["distance_m"]
+                stop_info["bearing_deg"] = vec["bearing_deg"]
+                stop_info["cardinal"] = vec["cardinal"]
+            return stop_info
+
         info = {
             "filename": n_name,
             "date_time": n_dt,
@@ -540,12 +564,10 @@ def compute_neighbor_vectors(
             "trail_gradient": _format_trail_gradient(elev_change_ft),
             "elapsed_time_min": elapsed_min,
         }
-        if target_lat is not None and target_lon is not None and n_lat is not None and n_lon is not None:
+        if vec is not None:
             if is_prev:
-                vec = calculate_haversine(n_lat, n_lon, target_lat, target_lon)
                 info["travel_vector_from_prev"] = vec
             else:
-                vec = calculate_haversine(target_lat, target_lon, n_lat, n_lon)
                 info["travel_vector_to_next"] = vec
         return info
 
@@ -641,7 +663,7 @@ def compute_neighbor_vectors(
                 qualifies = True
 
             if qualifies:
-                stops.append(build_neighbor(cand, is_prev=is_prev))
+                stops.append(build_neighbor(cand, is_prev=is_prev, compact_stop=True))
                 if c_lat is not None and c_lon is not None:
                     anchor_lat, anchor_lon = c_lat, c_lon
                 if c_dt is not None:
@@ -713,6 +735,88 @@ def format_camera_spec(camera_model, lens_model, focal_mm, focal_35mm, hfov_deg,
     return ", ".join(parts) if parts else "[Not available]"
 
 
+def format_compact_json(data, indent_level=0):
+    """
+    Formats a Python dict/list as 100% valid JSON while keeping list-of-dict arrays
+    (elevation_deltas, prev_hike_stops, next_hike_stops) and nested dictionaries
+    (prev_photo, next_photo, admin_boundaries) to 1 compact single-line JSON object
+    per element so stdout remains compact (~2.5-4.3 KB) even with 25+ --ref-elev-ft flags.
+    """
+    pad = " " * indent_level
+    next_pad = " " * (indent_level + 1)
+    if isinstance(data, dict):
+        if not data:
+            return "{}"
+        if indent_level >= 1:
+            clean_dict = {k: v for k, v in data.items() if v is not None}
+            return json.dumps(clean_dict, ensure_ascii=False, separators=(",", ":"))
+        lines = ["{"]
+        items = list(data.items())
+        for idx, (k, v) in enumerate(items):
+            comma = "," if idx < len(items) - 1 else ""
+            k_str = json.dumps(str(k), ensure_ascii=False)
+            if isinstance(v, (dict, list)):
+                v_str = format_compact_json(v, indent_level + 1)
+                lines.append(f"{next_pad}{k_str}: {v_str}{comma}")
+            else:
+                v_str = json.dumps(v, ensure_ascii=False)
+                lines.append(f"{next_pad}{k_str}: {v_str}{comma}")
+        lines.append(f"{pad}}}")
+        return "\n".join(lines)
+    elif isinstance(data, list):
+        if not data:
+            return "[]"
+        if all(isinstance(el, dict) for el in data):
+            lines = ["["]
+            for idx, el in enumerate(data):
+                comma = "," if idx < len(data) - 1 else ""
+                el_str = json.dumps(el, ensure_ascii=False, separators=(",", ":"))
+                lines.append(f"{next_pad}{el_str}{comma}")
+            lines.append(f"{pad}]")
+            return "\n".join(lines)
+        else:
+            return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    else:
+        return json.dumps(data, ensure_ascii=False)
+
+
+def build_missing_gps_guidance(lat, lon, prev_photo, next_photo):
+    """
+    Returns an explicit Stage 1 guidance warning when EXIF GPS is missing (lat is None or lon is None),
+    distinguishing whether the photo can be tightly interpolated on foot within <= 15 minutes
+    between two geotagged neighbors or requires reading post.md immediately.
+    """
+    if lat is not None and lon is not None:
+        return None
+
+    prev_ok = (
+        isinstance(prev_photo, dict)
+        and prev_photo.get("lat") is not None
+        and prev_photo.get("lon") is not None
+        and prev_photo.get("elapsed_time_min") is not None
+        and float(prev_photo.get("elapsed_time_min")) <= 15.0
+    )
+    next_ok = (
+        isinstance(next_photo, dict)
+        and next_photo.get("lat") is not None
+        and next_photo.get("lon") is not None
+        and next_photo.get("elapsed_time_min") is not None
+        and float(next_photo.get("elapsed_time_min")) <= 15.0
+    )
+
+    if prev_ok and next_ok:
+        return (
+            "EXIF GPS is missing (lat: null, lon: null), but both prev_photo and next_photo are geotagged within <= 15 min. "
+            "Interpolate camera coordinates along the trail between prev_photo and next_photo (or read post.md if location context "
+            "is ambiguous) and keep your estimated (lat, lon) fixed across geo_tools.py calls."
+        )
+    return (
+        "EXIF GPS is missing (lat: null, lon: null) and cannot be tightly interpolated between adjacent foot-travel photos within <= 15 min. "
+        "Stage 1 Exception applies: Read post.md immediately BEFORE running geo_tools.py to determine whether this photo was taken at a "
+        "pre-hike camp, shuttle staging trailhead, or highway viewpoint rather than guessing the coordinates of next_photo/prev_photo."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract photo EXIF, USGS ground elevation, lens FOV, admin boundaries, and neighbor travel vectors.")
     parser.add_argument("photo_path", nargs="?", default=None, help="Path to the target image file")
@@ -763,10 +867,12 @@ def main():
         exif = all_exif[0]
 
     date_time = exif.get("DateTimeOriginal", "[Not available in EXIF]")
-    lat = exif.get("GPSLatitude")
+    raw_lat = exif.get("GPSLatitude")
     lat_ref = exif.get("GPSLatitudeRef")
-    lon = exif.get("GPSLongitude")
+    raw_lon = exif.get("GPSLongitude")
     lon_ref = exif.get("GPSLongitudeRef")
+    lat = round(float(raw_lat), 6) if raw_lat is not None else None
+    lon = round(float(raw_lon), 6) if raw_lon is not None else None
     exif_alt_m = exif.get("GPSAltitude")
     focal_length_raw = exif.get("FocalLength")
     focal_length_35mm = exif.get("FocalLengthIn35mmFormat")
@@ -822,9 +928,9 @@ def main():
                 "before overriding estimated_single_frame_hfov_deg; if stitched, use horizon-skyline --az-min <min> --az-max <max> --projection cylindrical."
             )
 
-    if lat is not None and lon is not None:
-        lat_dms = format_dms(lat, lat_ref, is_lat=True)
-        lon_dms = format_dms(lon, lon_ref, is_lat=False)
+    if raw_lat is not None and raw_lon is not None:
+        lat_dms = format_dms(raw_lat, lat_ref, is_lat=True)
+        lon_dms = format_dms(raw_lon, lon_ref, is_lat=False)
         gps_dms = f"{lat_dms} {lon_dms}"
     else:
         gps_dms = "[Not available in EXIF]"
@@ -840,11 +946,11 @@ def main():
     ground_elev_ft, ground_elev_m = None, None
     dem = None
     admin_boundaries = None
-    if lat is not None and lon is not None:
+    if raw_lat is not None and raw_lon is not None:
         _import_geo_tools()
-        dem = get_dem_patch_for_coords(lat, lon, radius_km=22.0)
-        ground_elev_ft, ground_elev_m = query_usgs_elevation(lat, lon, dem=dem)
-        admin_boundaries = query_admin_boundaries(lat, lon, timeout=3.0)
+        dem = get_dem_patch_for_coords(raw_lat, raw_lon, radius_km=22.0)
+        ground_elev_ft, ground_elev_m = query_usgs_elevation(raw_lat, raw_lon, dem=dem)
+        admin_boundaries = query_admin_boundaries(raw_lat, raw_lon, timeout=3.0)
 
     chosen_ft = ground_elev_ft if ground_elev_ft is not None else exif_alt_ft
     chosen_m = ground_elev_m if ground_elev_m is not None else exif_alt_m
@@ -864,11 +970,7 @@ def main():
                 diff_m = round(diff_ft * 0.3048)
                 direction = "above" if diff_ft >= 0 else "below"
                 elevation_deltas.append({
-                    "label": label,
-                    "ref_elevation_ft": round(ref_ft),
-                    "delta_ft": abs(diff_ft),
-                    "delta_m": abs(diff_m),
-                    "formatted": f"~{abs(diff_ft):,} ft / {abs(diff_m):,} m {direction} {label}",
+                    f"{label} ({round(ref_ft):,} ft)": f"~{abs(diff_ft):,} ft / {abs(diff_m):,} m {direction}"
                 })
             except ValueError:
                 pass
@@ -876,8 +978,8 @@ def main():
     prev_photo, next_photo, prev_hike_stops, next_hike_stops = compute_neighbor_vectors(
         photo_path,
         all_exif,
-        lat,
-        lon,
+        raw_lat,
+        raw_lon,
         date_time,
         target_elev_ft=chosen_ft,
         target_elev_m=chosen_m,
@@ -885,12 +987,18 @@ def main():
         return_hike_stops=True,
     )
 
+    missing_gps_guidance = build_missing_gps_guidance(lat, lon, prev_photo, next_photo)
+
     result = {
         "photo_path": photo_path,
         "date_time": date_time,
         "gps_dms": gps_dms,
         "lat": lat,
         "lon": lon,
+    }
+    if missing_gps_guidance is not None:
+        result["missing_gps_guidance"] = missing_gps_guidance
+    result.update({
         "ground_elevation_ft": ground_elev_ft,
         "ground_elevation_m": ground_elev_m,
         "exif_elevation_ft": exif_alt_ft,
@@ -914,11 +1022,11 @@ def main():
         "next_photo": next_photo,
         "prev_hike_stops": prev_hike_stops,
         "next_hike_stops": next_hike_stops,
-    }
+    })
     if elevation_deltas:
         result["elevation_deltas"] = elevation_deltas
 
-    print(json.dumps(result, indent=2))
+    print(format_compact_json(result))
 
 
 if __name__ == "__main__":

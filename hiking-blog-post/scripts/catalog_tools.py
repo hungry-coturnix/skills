@@ -305,6 +305,139 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
     return issues
 
 
+_NEGATED_DISCREPANCY_RE = re.compile(
+    r"\b(?:no|zero|without)\s+(?:[\w&-]+\s+){0,6}discrepanc\w*|\bconsistent\s+with\b",
+    re.IGNORECASE,
+)
+_DISCREPANCY_SIGNAL_RE = re.compile(
+    r"\b(?:discrepanc\w*|reconcil\w*|mismatch\w*|inaccura\w*|erroneous\w*|incorrect\w*|off\s+by\s+>?\s*\d+)\b",
+    re.IGNORECASE,
+)
+_NOTE_BLOCK_START_RE = re.compile(
+    r"^\s*(?:[-*]\s+)?(?:\*+)?(?:"
+    r"Geometric|Chronological|Placement\s+Rationale|Context\s*(?:&\s*Placement)?\s*Rationale|"
+    r"Placement\s*&\s*Geometric|Draft\s+Alignment|"
+    r"Out-of-Frame|Line-of-Sight|Narrative\s+Cross-Check|Elevation\s+Verification|"
+    r"Verification\s+Note|Note\s+for\s+`?post\.md`?\s+context"
+    r")[^:\n]*?(?:\*+)?\s*:",
+    re.IGNORECASE,
+)
+_INLINE_NOTE_TAIL_RE = re.compile(
+    r"(?:\s+[-*]\s+\*\*|\s+\*\*)(?:"
+    r"Geometric|Chronological|Placement\s+Rationale|Context\s*(?:&\s*Placement)?\s*Rationale|"
+    r"Placement\s*&\s*Geometric|Draft\s+Alignment|"
+    r"Out-of-Frame|Line-of-Sight|Narrative\s+Cross-Check|Elevation\s+Verification"
+    r")[^:*]*?\*\*\s*:.*$",
+    re.IGNORECASE,
+)
+_UNBOLDED_NOTE_TAIL_RE = re.compile(
+    r"\s+(?:Geometric\s+(?:cross-check\s+)?note(?:\s+for\s+draft\s+context)?|"
+    r"Note\s+for\s+`?post\.md`?\s+context)\s*:.*$",
+    re.IGNORECASE,
+)
+_PAREN_NOTE_RE = re.compile(
+    r"\s*\*?\((?:Geometric\s+note|Note\s*:\s*All\s+peak|Note\s*:\s*(?:[^()]|\([^()]*\))*?\bare\s+still\s+topographically\s+occluded)(?:[^()]|\([^()]*\))*\)\*?",
+    re.IGNORECASE,
+)
+_NO_DISCREPANCY_SENTENCE_RE = re.compile(
+    r"\s*No\s+(?:geographic|geometric|elevation|narrative|draft)"
+    r"(?:\s+(?:or|and)\s+(?:geographic|geometric|elevation|narrative|draft))*"
+    r"\s+discrepancies\s+exist(?:`[^`]*`|[^.])*\.\s*",
+    re.IGNORECASE,
+)
+
+
+def _has_discrepancy_flag(text: str) -> bool:
+    scrubbed = _NEGATED_DISCREPANCY_RE.sub(" ", text)
+    return bool(_DISCREPANCY_SIGNAL_RE.search(scrubbed))
+
+
+def _compact_placement_summary(sec_lines: List[str]) -> str:
+    """
+    Strips verbose non-discrepancy `- **Geometric & Chronological Note**:` bullets
+    and redundant post-quote commentary from `Suggested Draft Placement` while
+    preserving the placement target/quote and any Discrepancy / Reconciliation flag.
+    """
+    blocks: List[Tuple[bool, List[str]]] = []
+    for raw_line in sec_lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        is_subbullet = bool(re.match(r"^\s{2,}[-*]\s+", raw_line))
+        is_note_start = bool(
+            _NOTE_BLOCK_START_RE.match(stripped)
+            or re.match(
+                r"^\*?\((?:Geometric\s+note|Note\s*:|Elevation\s+note|Note\s+for\s+draft)",
+                stripped,
+                re.IGNORECASE,
+            )
+            or re.match(r"^(?:Taken|Captured)\s+(?:at\s+`?\d|~`?\d)", stripped)
+        )
+        is_top_bullet = bool(re.match(r"^\s{0,1}[-*]\s+", raw_line)) and not is_subbullet
+
+        if is_subbullet and blocks and blocks[-1][0]:
+            blocks[-1][1].append(stripped)
+        elif is_note_start:
+            blocks.append((True, [stripped]))
+        elif is_top_bullet or not blocks or blocks[-1][0]:
+            blocks.append((False, [stripped]))
+        else:
+            blocks[-1][1].append(stripped)
+
+    kept_parts: List[str] = []
+    for is_note, blk_lines in blocks:
+        blk_text = re.sub(r"\s+", " ", " ".join(blk_lines)).strip()
+        if is_note and not _has_discrepancy_flag(blk_text):
+            continue
+        kept_parts.append(blk_text)
+
+    placement = re.sub(r"\s+", " ", " ".join(kept_parts)).strip()
+    if not placement:
+        placement = re.sub(r"\s+", " ", "\n".join(sec_lines)).strip()
+
+    placement = _NO_DISCREPANCY_SENTENCE_RE.sub(" ", placement).strip()
+
+    for tail_re in (_INLINE_NOTE_TAIL_RE, _UNBOLDED_NOTE_TAIL_RE):
+        m_tail = tail_re.search(placement)
+        if m_tail and not _has_discrepancy_flag(m_tail.group(0)):
+            placement = placement[: m_tail.start()].strip()
+
+    for m_paren in list(_PAREN_NOTE_RE.finditer(placement)):
+        if not _has_discrepancy_flag(m_paren.group(0)):
+            placement = (placement[: m_paren.start()] + " " + placement[m_paren.end() :]).strip()
+
+    # Strip trailing non-discrepancy commentary sentences after the verbatim quote
+    m_post_quote = re.search(
+        r'([*"”\'`\)]\.?\s+)((?:Taken|Captured)\s+(?:at\s+`?\d|~`?\d|directly\s+on\b).*|'
+        r'This\s+photo\s+(?:was\s+captured|directly\s+(?:illustrates|captures)|illustrates|captures)\b.*|'
+        r'Note\s+that\s+\*\*.*)$',
+        placement,
+    )
+    if m_post_quote and not _has_discrepancy_flag(m_post_quote.group(2)):
+        placement = placement[: m_post_quote.start(2)].strip()
+
+    # Compact overly long verbatim post.md quotes (> 160 chars) to first 75 + ... + last 65 chars
+    def _shorten_quote(m: re.Match) -> str:
+        open_q, body, close_q = m.group(1), m.group(2), m.group(3)
+        if len(body) <= 160 or _has_discrepancy_flag(body):
+            return m.group(0)
+        return f"{open_q}{body[:75].rstrip()} ... {body[-65:].lstrip()}{close_q}"
+
+    placement = re.sub(
+        r'(\*"|`"|“|")(.{161,}?)("\*|"`|”|")',
+        _shorten_quote,
+        placement,
+    )
+    placement = re.sub(
+        r"^\s*[-*]\s*\*\*(?:Placement|Target\s+Section)\*\*\s*:\s*",
+        "",
+        placement,
+        flags=re.IGNORECASE,
+    )
+
+    return re.sub(r"\s+", " ", placement).strip()
+
+
 def extract_entry_summary_fields(entry_text: str) -> Dict[str, str]:
     """
     Extracts single-line `location`, `placement`, and `caption` fields from a
@@ -326,11 +459,10 @@ def extract_entry_summary_fields(entry_text: str) -> Dict[str, str]:
         if not lines:
             continue
         sec_title = lines[0].strip().lower()
-        sec_body = re.sub(r"\s+", " ", "\n".join(lines[1:])).strip()
         if "suggested draft placement" in sec_title:
-            placement = sec_body
+            placement = _compact_placement_summary(lines[1:])
         elif "suggested caption" in sec_title:
-            caption = sec_body
+            caption = re.sub(r"\s+", " ", "\n".join(lines[1:])).strip()
 
     return {
         "location": location,
