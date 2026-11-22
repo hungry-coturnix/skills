@@ -337,16 +337,49 @@ def print_conversation_summary(r: Dict[str, Any]) -> None:
     print()
 
 
+def get_skill_fs_last_modified(skill_name: str) -> Optional[str]:
+    """Returns ISO UTC timestamp of the most recently modified file in the skill directory."""
+    from datetime import datetime, timezone
+    candidates = [
+        Path(r"C:\Users\Tilman\.gemini\config\skills") / skill_name,
+        Path(r"C:\Users\Tilman\.gemini\antigravity\builtin\skills") / skill_name,
+    ]
+    latest_mtime = 0.0
+    for sdir in candidates:
+        if sdir.exists() and sdir.is_dir():
+            for p in sdir.rglob("*"):
+                if p.is_file() and "__pycache__" not in p.parts:
+                    try:
+                        mt = p.stat().st_mtime
+                        if mt > latest_mtime:
+                            latest_mtime = mt
+                    except OSError:
+                        pass
+    if latest_mtime > 0:
+        return datetime.fromtimestamp(latest_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
+
+
 def cmd_discover(args: argparse.Namespace) -> None:
     brain_dir = Path(args.brain_dir)
     skill_name = args.skill.lower().strip()
 
     all_convs: Dict[str, Dict[str, Any]] = {}
     parent_map: Dict[str, str] = {}  # child_id -> parent_id
+    permission_denied_count = 0
 
     for conv_dir in sorted(brain_dir.iterdir()):
         if not conv_dir.is_dir():
             continue
+        try:
+            # Probe directory access to detect Windows sandbox restriction
+            list(os.scandir(conv_dir))
+        except PermissionError:
+            permission_denied_count += 1
+            continue
+        except OSError:
+            continue
+
         info = analyze_conversation(conv_dir)
         if info:
             cid = info["conversation_id"].lower()
@@ -355,8 +388,20 @@ def cmd_discover(args: argparse.Namespace) -> None:
                 if sub["child_id"]:
                     parent_map[sub["child_id"].lower()] = cid
 
+    if permission_denied_count > 0:
+        print(
+            f"WARNING: PermissionError on {permission_denied_count} conversation directories in {brain_dir}. "
+            f"In the Windows sandbox, only the current conversation is readable. "
+            f"Re-run this command with BypassSandbox: true to scan all historical trajectories!\n",
+            file=sys.stderr,
+        )
+
     matched_ids: Set[str] = set()
+    edit_milestones: List[Tuple[str, str]] = []
+
     for cid, info in all_convs.items():
+        if skill_name in info["skills_edited"]:
+            edit_milestones.append((info["ended_at"], cid))
         if (
             skill_name in info["skills_read"]
             or skill_name in info["skills_edited"]
@@ -367,6 +412,15 @@ def cmd_discover(args: argparse.Namespace) -> None:
             if cid in parent_map:
                 matched_ids.add(parent_map[cid])
 
+    edit_milestones.sort(key=lambda x: x[0])
+    latest_edit_ts = edit_milestones[-1][0] if edit_milestones else ""
+    latest_edit_cid = edit_milestones[-1][1] if edit_milestones else ""
+
+    fs_mtime_iso = get_skill_fs_last_modified(skill_name)
+    effective_since = args.since.strip() if getattr(args, "since", None) else ""
+    if getattr(args, "after_last_update", False) and not effective_since:
+        effective_since = latest_edit_ts or (fs_mtime_iso or "")
+
     sorted_cids = sorted(matched_ids, key=lambda c: all_convs[c]["created_at"])
 
     results = []
@@ -376,6 +430,10 @@ def cmd_discover(args: argparse.Namespace) -> None:
         role_class = classify_trajectory(info, skill_name, pid)
         if args.executed_only and role_class not in ("EXECUTED", "DELEGATED_OR_MENTIONED"):
             continue
+        if effective_since:
+            # Keep parent orchestrators whose ended_at is after effective_since, or trajectories created after effective_since
+            if info["created_at"] < effective_since and info["ended_at"] < effective_since:
+                continue
         info["parent_conversation_id"] = pid
         info["classification"] = role_class
         results.append(info)
@@ -385,10 +443,77 @@ def cmd_discover(args: argparse.Namespace) -> None:
         return
 
     print(f"=== Trajectory Discovery Report for Skill: `{skill_name}` ===")
-    print(f"Total matching trajectories: {len(results)}\n")
+    if edit_milestones:
+        print(f"Recent Skill Edit Milestones (`{skill_name}`):")
+        for ts, ecid in edit_milestones[-8:]:
+            print(f"  - {ts} (Conversation: {ecid})")
+    if fs_mtime_iso:
+        print(f"Skill Files Last Modified (UTC)      : {fs_mtime_iso}")
+    if effective_since:
+        print(f"Filtered Since Timestamp             : {effective_since}")
+    print(f"Total matching trajectories          : {len(results)}\n")
 
     for r in results:
         print_conversation_summary(r)
+
+
+def cmd_assemble_raw(args: argparse.Namespace) -> None:
+    """Deterministically merges per-file raw recommendation markdown files into recommendations_raw.md."""
+    import shutil
+    in_dir = Path(args.input_dir)
+    out_file = Path(args.out_file)
+    skill_name = args.skill
+
+    if not in_dir.exists() or not in_dir.is_dir():
+        print(f"Error: Input directory not found: {in_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    md_files = sorted(f for f in in_dir.iterdir() if f.is_file() and f.suffix.lower() == ".md")
+    if not md_files:
+        print(f"Error: No .md files found in {in_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    toc_lines = []
+    sections = []
+    for i, fpath in enumerate(md_files, 1):
+        text = fpath.read_text(encoding="utf-8", errors="replace").strip()
+        # Strip leading H1 if present so we can standardize section headers
+        lines = text.splitlines()
+        title = fpath.stem
+        if lines and lines[0].startswith("# "):
+            title = lines[0][2:].strip()
+            body = "\n".join(lines[1:]).strip()
+        else:
+            body = text
+        anchor = re.sub(r"[^a-z0-9_-]", "", f"{i}-{title.lower().replace(' ', '-')}")
+        toc_lines.append(f"{i}. [`{title}`](#{anchor})")
+        sections.append(f"## {i}. `{title}`\n\n{body}")
+
+    header = (
+        f"# Raw Extracted Recommendations (`{skill_name}` Skill & Tools)\n\n"
+        f"This document compiles the raw, detailed recommendations extracted by {len(md_files)} dedicated "
+        f"subagents from the trajectory analysis reports. Each section preserves the full context, target "
+        f"file/line references, empirical trajectory evidence, and actionable implementation specifications.\n\n"
+        f"---\n\n"
+        f"## Table of Contents\n\n"
+        + "\n".join(toc_lines)
+        + "\n\n---\n\n"
+    )
+    full_text = header + "\n\n---\n\n".join(sections) + "\n"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    out_file.write_text(full_text, encoding="utf-8", newline="\n")
+
+    if getattr(args, "cleanup", False):
+        shutil.rmtree(in_dir, ignore_errors=True)
+
+    print(json.dumps({
+        "status": "assembled",
+        "files_merged": len(md_files),
+        "output_file": str(out_file),
+        "total_bytes": len(full_text.encode("utf-8")),
+        "cleaned_up_staging": bool(getattr(args, "cleanup", False)),
+    }, indent=2))
+
 
 
 def parse_step_filter(spec: str) -> Set[int]:
@@ -410,6 +535,16 @@ def cmd_inspect(args: argparse.Namespace) -> None:
     conv_dir = brain_dir / args.conversation_id
     if not conv_dir.exists():
         print(f"Error: Conversation directory not found: {conv_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        list(os.scandir(conv_dir))
+    except PermissionError:
+        print(
+            f"Error: PermissionError accessing {conv_dir}. "
+            f"Re-run this command with BypassSandbox: true to inspect conversations outside the current session!",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if args.summary:
@@ -496,6 +631,8 @@ def main() -> None:
     p_disc = subparsers.add_parser("discover", help="Find all trajectories where a skill was used.")
     p_disc.add_argument("--skill", required=True, help="Skill name to search for (e.g., photo-analysis).")
     p_disc.add_argument("--executed-only", action="store_true", help="Only show trajectories where the skill was executed or delegated.")
+    p_disc.add_argument("--since", default="", help="Only show trajectories created/active on or after this ISO timestamp (e.g. '2026-11-06T06:14:21Z').")
+    p_disc.add_argument("--after-last-update", action="store_true", help="Automatically filter to trajectories created/active after the latest skill edit.")
     p_disc.add_argument("--json", action="store_true", help="Output raw JSON.")
 
     p_insp = subparsers.add_parser("inspect", help="Inspect steps of a specific trajectory.")
@@ -508,11 +645,19 @@ def main() -> None:
     p_insp.add_argument("--errors-only", action="store_true", help="Only show steps with errors or non-zero exit codes.")
     p_insp.add_argument("--max-chars", type=int, default=2000, help="Max characters per field to display (default: 2000).")
 
+    p_asm = subparsers.add_parser("assemble-raw", help="Assemble per-trajectory extracted recommendation markdown files into recommendations_raw.md.")
+    p_asm.add_argument("--input-dir", required=True, help="Directory containing per-analysis extracted .md files.")
+    p_asm.add_argument("--out-file", required=True, help="Output path for recommendations_raw.md.")
+    p_asm.add_argument("--skill", required=True, help="Target skill name for header formatting.")
+    p_asm.add_argument("--cleanup", action="store_true", help="Remove input-dir after assembling recommendations_raw.md.")
+
     args = parser.parse_args()
     if args.subcommand == "discover":
         cmd_discover(args)
     elif args.subcommand == "inspect":
         cmd_inspect(args)
+    elif args.subcommand == "assemble-raw":
+        cmd_assemble_raw(args)
 
 
 if __name__ == "__main__":
