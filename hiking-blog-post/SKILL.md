@@ -120,7 +120,7 @@ following format:
 
 After inserting all `[PHOTO: <filename>][CAPTION: <caption>]` placeholders into
 `<date>/post.md`, run the validation subcommand to verify 1:1 photo coverage
-and editorial compliance before presenting the final draft:
+and editorial compliance before presenting the synthesized draft:
 
 ```bash
 python C:\Users\Tilman\.gemini\config\skills\hiking-blog-post\scripts\catalog_tools.py validate "<workspace>/<date>"
@@ -130,6 +130,59 @@ Fix any reported `uncataloged_photos`, `unplaced_photos`, `duplicate_catalog_ent
 or `formatting_issues` (such as forbidden em-dashes `—`, leaked degree symbols `°`
 in captions or natural feature descriptions, or non-standard metadata bullets)
 until `validate` reports `"valid": true`.
+
+## Phase 5: Post-Photo Narrative Augmentation (Second Round of Interesting Facts)
+
+Once all photos and their narratives are integrated into `<date>/post.md` and
+validated in Phase 4, review the newly added photo landmarks, distant peaks,
+geological formations, flora, and wildlife encounters surfaced during Phase 3
+that were not yet covered in Phase 2.
+
+1. **Propose a Curated List of Additional Facts**: Present a numbered list of
+   6–8 interesting historical, geological, mountaineering, indigenous/etymological,
+   or ecological facts tied to specific newly incorporated photo sections (citing
+   the photo filename and line/section in `<date>/post.md` where each fact would
+   fit). Avoid duplicating facts already integrated in Phase 2.
+2. **Incorporate User-Selected Facts & Re-Validate**: Once the user selects
+   which facts to include (or asks to incorporate all of them), weave them
+   seamlessly into `<date>/post.md` following all editorial constraints (dual
+   units, spaced en-dashes ` – `, no em-dashes, no subheadings) and re-run
+   `catalog_tools.py validate "<workspace>/<date>"` to confirm `"valid": true`
+   with zero formatting issues.
+
+## Phase 6: Comprehensive Editorial Review
+
+After Phase 5 augmentations are integrated into `<date>/post.md`, perform a
+thorough end-to-end editorial review of the entire blog post (both narrative
+prose and `[CAPTION: ...]` blocks).
+
+1. **Audit for Editorial & Narrative Quality**: Read `<date>/post.md` in full
+   and systematically check for:
+   - **Factual or Quantitative Inconsistencies**: Conflicting elevations,
+     distances, directional bearings, timestamps, or landmark names across the
+     header, narrative prose, photo captions, and summary footer (e.g., dual
+     benchmarks or slightly different DEM vs. USGS elevations cited for the
+     same peak across different paragraphs/captions).
+   - **Redundancy & Duplication**: Verbatim or near-verbatim phrasing repeated
+     between a paragraph and its immediately following `[CAPTION: ...]`, or the
+     same descriptive adjectives, geological explanations, or peak lists echoed
+     across consecutive photo transitions.
+   - **Stylistic & Pacing Issues**: Formulaic photo-intro sentence structures
+     (e.g., repeatedly starting consecutive paragraphs with *"Looking back..."*
+     or *"Climbing higher to X ft / Y m..."*), overly dense parenthetical peak
+     lists in the prose that disrupt narrative flow, or awkward sentence rhythm.
+   - **Abrupt Tone Shifts**: Jarring transitions between personal first-person
+     trail storytelling and encyclopedic/textbook-style historical, geological,
+     or ecological inserts.
+2. **Present Findings & Ask for User Selection**: Present a clear, numbered list
+   of specific editorial findings and proposed improvements (referencing exact
+   lines in `<date>/post.md`), and ask the user which changes they would like to
+   incorporate.
+3. **Apply Approved Refinements & Re-Validate**: Once the user indicates which
+   refinements to apply, edit `<date>/post.md` (and `<date>/catalog.md` if any
+   caption text is updated so the two stay in sync) and re-run
+   `catalog_tools.py validate "<workspace>/<date>"` to confirm `"valid": true`
+   with zero formatting issues.
 
 ## Editorial Constraints
 
