@@ -23,61 +23,18 @@ Inspecting multi-megabyte JSONL transcripts, reading 10–20 markdown findings r
 
 To keep the Main Agent's context window lightweight across the entire lifecycle, `trajectory-judge` enforces a **5-Step Distributed Subagent Pipeline** where heavy reading, writing, synthesis, scrutiny, editing, and testing are offloaded to specialized subagents that persist intermediate artifacts on disk in `<findings-dir>/` (e.g., `<workspace>/findings-YYYY-MM-DD/`):
 
-```
-=====================================================================================
-STEP 1: Trajectory Discovery & Distributed Subagent Inspection
-=====================================================================================
-Main Agent runs `scan_trajectories.py discover` -> spawns Trajectory Inspector Subagents
-  ├── Inspector Subagent 1 (Outlier/Error Trajectory) ──> <findings-dir>/<conv-id-1>.md
-  ├── Inspector Subagent 2 (Parent Orchestrator)      ──> <findings-dir>/parent_<id>.md
-  └── Inspector Subagent N (Clean Batch Runs)         ──> <findings-dir>/batch_<name>.md
-  (Optional: Main Agent queries Inspector Subagents via `send_message` for cross-run checks)
-
-=====================================================================================
-STEP 2: Distributed Recommendation Extraction (`recommendations_raw.md`)
-=====================================================================================
-Main Agent spawns 1 Recommendation Extractor Subagent per findings `.md` file
-  ├── Extractor Subagent 1 reads `<conv-id-1>.md` ──> <findings-dir>/raw_extracted/01_<stem>.md
-  └── Extractor Subagent N reads `batch_<name>.md` ──> <findings-dir>/raw_extracted/N_<stem>.md
-Main Agent runs `scan_trajectories.py assemble-raw` ──> <findings-dir>/recommendations_raw.md
-
-=====================================================================================
-STEP 3: Deduplication & Logical Consolidation (`recommendations_consolidated.md`)
-=====================================================================================
-Main Agent spawns Recommendation Consolidator Subagent
-  └── Reads `recommendations_raw.md`, deduplicates & groups by Target Component / Theme
-      while preserving 100% of actionable specs ──> <findings-dir>/recommendations_consolidated.md
-
-=====================================================================================
-STEP 4: Independent Scrutiny & Side-Effect Audit (`recommendations_final.md`)
-=====================================================================================
-Main Agent spawns Independent Scrutiny Auditor Subagent (Blind to raw/trajectory files)
-  ├── Audits `recommendations_consolidated.md` ONLY against live `SKILL.md` & `scripts/`
-  ├── Flags 🔴 High-Risk Regressions, 🟡 Modifications Needed, 🟢 Safe As-Is
-  ├── Main Agent presents scrutiny verdicts to User for confirmation (User Decision Gate)
-  └── Subagent incorporates approved adjustments ──> <findings-dir>/recommendations_final.md
-
-=====================================================================================
-STEP 5: Component-Isolated Implementation & Independent Verification
-=====================================================================================
-Step 5A (Implementation): Main Agent spawns Component Engineer Subagents (Disjoint File Ownership)
-  ├── Engineer Subagent A (ONLY edits `SKILL.md`)
-  ├── Engineer Subagent B (ONLY edits `scripts/tool_a.py`)
-  └── Engineer Subagent C (ONLY edits companion skill / `scripts/tool_b.py`)
-Step 5B (Independent Verification): Main Agent spawns NEW Verification Auditor Subagents
-  ├── Auditor Subagent 1 (Line-by-line & live CLI audit of `SKILL.md` vs `recommendations_final.md`)
-  ├── Auditor Subagent 2 (Line-by-line & live CLI audit of `scripts/tool_a.py`)
-  └── Auditor Subagent 3 (Line-by-line & live CLI audit of companion skill / `scripts/tool_b.py`)
-```
+1. **Step 1 (Trajectory Discovery & Distributed Inspection)**: Main Agent runs `scan_trajectories.py discover` and spawns Trajectory Inspector Subagents (1 per outlier/error trajectory, 1 for parent orchestrator, and 1 per clean batch) writing `<findings-dir>/<name>.md`.
+2. **Step 2 (Distributed Recommendation Extraction)**: Main Agent spawns 1 Extractor Subagent per findings file (`<findings-dir>/raw_extracted/<stem>.md`) and runs `scan_trajectories.py assemble-raw` to produce `<findings-dir>/recommendations_raw.md`.
+3. **Step 3 (Deduplication, Generalization & Consolidation)**: Main Agent spawns a Recommendation Consolidator Subagent that deduplicates, strips hike/case-specific overfitting, enforces code-over-prompt hierarchy, and writes `<findings-dir>/recommendations_consolidated.md`.
+4. **Step 4 (Independent Technical Scrutiny & Finalization)**: Main Agent spawns an Independent Scrutiny Auditor Subagent (blind to raw/trajectory files) to audit `recommendations_consolidated.md` against live `SKILL.md` & `scripts/`, presents lettered verdicts (`A, B, C, ...`) at the User Decision Gate, and writes `<findings-dir>/recommendations_final.md`.
+5. **Step 5 (Component-Isolated Implementation & Independent Verification)**: Main Agent spawns disjoint-file Implementation Engineer Subagents (Step 5A), followed by fresh Independent Verification Auditor Subagents (Step 5B) that run live CLI tests and line-by-line verification.
 
 ### Core Orchestration Rules for the Main Agent
-1. **Never Read Bulk Artifacts in the Main Agent**: The Main Agent must **not** read all individual `<findings-dir>/*.md` files, must **not** read or write the full `recommendations_raw.md` or `recommendations_consolidated.md` in its own context, and must **not** read multi-thousand-line target scripts directly. Delegate those reads/writes to the step-specific subagents, which return compact summaries to the Main Agent.
-2. **Use `TypeName: "self"` for File-Writing Subagents**: In Antigravity, `research` subagents run in a read-only sandbox and cannot call `write_file`, `edit_file`, or `run_command` with `BypassSandbox: true`. Always invoke subagents that write markdown files or run CLI tools with `TypeName: "self"`.
-3. **Pass `BypassSandbox: true` When Scanning `<appDataDir>/brain/` on Windows**: The Windows terminal sandbox restricts directory listing and file reads inside `<appDataDir>/brain/` to the current conversation only (`PermissionError: [WinError 5] Access is denied` on all other conversations). Always run `scan_trajectories.py discover` and `scan_trajectories.py inspect` with `BypassSandbox: true`.
-4. **Zero-Polling Reactive Wakeup**: After spawning subagents via `invoke_subagent` or messaging them via `send_message`, do **not** poll `manage_subagents` or `manage_task` in a loop. Stop calling tools and let the system automatically wake you when subagents complete.
-5. **Flexible Entry & Pause Points**:
-   - If the user asks to run the full end-to-end procedure, execute Steps 1 $\rightarrow$ 4 (pausing at the Step 4 User Decision Gate so the user can review the scrutiny verdicts before applying edits in Step 5, unless the user explicitly requested autonomous application).
-   - If the user points to an existing `<findings-dir>/` (e.g., `findings-2026-11-21/recommendations_consolidated.md`), start directly at the corresponding step.
+1. **Never Read Bulk Artifacts in the Main Agent**: The Main Agent must **not** read all individual `<findings-dir>/*.md` files, must **not** read or write the full `recommendations_raw.md` or `recommendations_consolidated.md` in its own context, and must **not** read multi-thousand-line target scripts directly. Delegate those reads/writes to step-specific subagents that return compact summaries.
+2. **Use `TypeName: "self"` for File-Writing Subagents**: `research` subagents run in a read-only sandbox and cannot call `write_file`, `edit_file`, or `run_command` with `BypassSandbox: true`. Always invoke subagents that write files or run CLI tools with `TypeName: "self"`.
+3. **Pass `BypassSandbox: true` When Scanning `<appDataDir>/brain/` on Windows**: The Windows sandbox restricts `<appDataDir>/brain/` access to the current conversation only. Always run `scan_trajectories.py discover` and `scan_trajectories.py inspect` with `BypassSandbox: true`.
+4. **Zero-Polling Reactive Wakeup**: After spawning subagents via `invoke_subagent` or messaging them via `send_message`, do **not** poll `manage_subagents` or `manage_task` in a loop. Stop calling tools and let the system wake you when subagents complete.
+5. **Flexible Entry & Pause Points**: Execute Steps 1 $\rightarrow$ 4 (pausing at the Step 4 User Decision Gate before Step 5 unless autonomous application was requested), or start directly at an existing `<findings-dir>/` artifact when specified by the user.
 
 ---
 
@@ -159,7 +116,9 @@ You are a dedicated Trajectory Inspector auditing historical Antigravity traject
    - Errors & critical step ranges: `python "C:\Users\Tilman\.gemini\config\skills\trajectory-judge\scripts\scan_trajectories.py" inspect --conversation-id <uuid> --steps <step-range> --full`
 3. Examine the `thinking` trace of `PLANNER_RESPONSE` steps around every user correction, error, token spike, compression boundary, and key decision to uncover confirmation bias, motivated reasoning, or instruction drift.
 4. Check `SKILL.md` byte size and `read_file` step behavior (e.g., whether `SKILL.md` exceeds `46,080 bytes` and forces 2-part `ByteOffset` reads, or whether tool JSON outputs exceed `~8–10 KB` and trigger mid-output truncation).
-5. Write your comprehensive markdown report to `<findings-dir>/<output-filename>.md` following the Standard Individual/Batch Trajectory Findings Template in `trajectory-judge/SKILL.md`. Ensure `## 6. Recommended Skill & Tool Fixes (Local Perspective)` contains complete, actionable specifications (exact file paths, line numbers, function names, CLI flags, and proposed code/wording changes).
+5. Write your comprehensive markdown report to `<findings-dir>/<output-filename>.md` following the Standard Individual/Batch Trajectory Findings Template in `trajectory-judge/SKILL.md`. Ensure `## 6. Recommended Skill & Tool Fixes (Local Perspective)` contains complete, actionable specifications (exact file paths, line numbers, function names, CLI flags, and proposed code/wording changes) while adhering to:
+   - **Code-Over-Prompt Hierarchy**: If an issue can be prevented deterministically in `scripts/` (e.g., auto-normalizing formatting on `upsert`, pre-validating benchmarks in `extract_metadata.py`, or returning a structured warning field), recommend a script change rather than adding prose warnings to `SKILL.md`.
+   - **Anti-Overfitting Rule (Zero Hike-Specific Rules or Nouns)**: Distinguish one-off user curiosity on a single photo (`N=1`) from systemic skill failures. Never propose adding hike-specific landmark names, specific historical/taxonomic anecdotes, or narrow subject-conditional rules (e.g., rules for flood trenches or specific rock formations) to `SKILL.md`; formulate all rules in general geometric/editorial terms using generic placeholder names (`Granite Peak`, `Twin Lakes`).
 6. Reply to the main agent with ONLY a concise 1–2 paragraph summary of your findings and confirmation of the written file path. Do NOT paste the full markdown report into your reply.
 ```
 
@@ -259,10 +218,12 @@ It contains specific recommendations to improve the `<skill-name>` skill, its he
 
 ### Your Consolidation Mission:
 1. **Deduplicate**: Merge overlapping or duplicate recommendations that appeared across multiple trajectory reports into unified items. Explicitly list which raw items each consolidated item merges (e.g., `*Consolidates: 1.1, 3.2, 5.1*`) and aggregate all supporting trajectory IDs and step numbers.
-2. **Group Logically by Target Component & Architectural Theme**: Organize recommendations into numbered Groups by target file and functional theme (e.g., `Group 1: <skill>/SKILL.md — Size, Structure & Token Hygiene`, `Group 2: <skill>/SKILL.md — Stage 1/2 Workflow & Guardrails`, `Group 3: <skill>/scripts/<script>.py — Core Logic & Caching`, `Group 4: Companion Skill & Tool Alignment`) rather than by trajectory.
-3. **Preserve 100% of Actionable Implementation Details**: Do NOT over-summarize or strip technical specifics. Preserve every exact file path, line number, function name, CLI flag, output JSON key, root-cause diagnostic, trajectory evidence citation, and exact proposed code/prompt wording required to implement the changes later.
-4. **Write Output**: Save the complete consolidated document (with a linked Table of Contents) to `<findings-dir>/recommendations_consolidated.md`.
-5. **Compact Reply**: Reply to the main agent with confirmation that `<findings-dir>/recommendations_consolidated.md` has been written, followed by a concise Table of Contents listing the Groups and recommendation titles.
+2. **Generalize & Strip Case-Specific Overfitting**: Generalize any recommendation that encodes a hike-specific landmark name, specific historical/taxonomic anecdote, or one-off (`N=1`) subject-specific rule into a general, domain-agnostic principle (or drop it if it was merely a one-off user follow-up question rather than a systemic failure). Replace any real audited landmark names in proposed `SKILL.md` examples with generic placeholders (`Granite Peak`, `Twin Lakes`).
+3. **Enforce Code-Over-Prompt & One-Rule-One-Place**: Whenever a consolidated recommendation adds both deterministic script auto-normalization/validation AND repetitive prose warnings in `SKILL.md`, keep the deterministic script enforcement and limit `SKILL.md` to a single concise statement in one section (never repeating the same rule across multiple sections of `SKILL.md`).
+4. **Group Logically by Target Component & Architectural Theme**: Organize recommendations into numbered Groups by target file and functional theme (e.g., `Group 1: <skill>/SKILL.md — Size, Structure & Token Hygiene`, `Group 2: <skill>/SKILL.md — Stage 1/2 Workflow & Guardrails`, `Group 3: <skill>/scripts/<script>.py — Core Logic & Caching`, `Group 4: Companion Skill & Tool Alignment`) rather than by trajectory.
+5. **Preserve 100% of Actionable Implementation Details**: Do NOT strip technical specifics needed for implementation. Preserve every exact file path, line number, function name, CLI flag, output JSON key, root-cause diagnostic, trajectory evidence citation, and exact proposed code/prompt wording.
+6. **Write Output**: Save the complete consolidated document (with a linked Table of Contents) to `<findings-dir>/recommendations_consolidated.md`.
+7. **Compact Reply**: Reply to the main agent with confirmation that `<findings-dir>/recommendations_consolidated.md` has been written, followed by a concise Table of Contents listing the Groups and recommendation titles.
 ```
 
 ---
@@ -288,6 +249,8 @@ You are an Independent Technical Scrutiny Auditor evaluating proposed updates in
 1. Read `<findings-dir>/recommendations_consolidated.md` in full (using `ByteOffset` if `> 46,080 bytes`).
 2. Read the actual current implementation of the target skill (`SKILL.md`), all target helper scripts in `scripts/`, and any referenced companion skill files.
 3. Scrutinize every recommendation for potential negative impacts, side effects, or flaws, checking specifically for:
+   - **Case-Specific Overfitting & Prompt Bloat (`SKILL.md` <= 38,000 Bytes, No Wall-of-Text Lines)**: Reject any proposed `SKILL.md` rule that encodes a one-off (`N=1`) photo subject (e.g., conditional rules for flood trenches or specific gully shapes), hardcodes real landmark/historical/taxonomic examples from audited trajectories, or repeats a constraint in multiple sections of `SKILL.md` when `scripts/` already auto-normalizes or pre-validates it. Enforce a strict `<= 38,000-byte` ceiling on `SKILL.md` (~8 KB of headroom below `read_file`'s `46,080-byte` limit) and forbid horizontal "wall-of-text" compression (packing multiple rules into `> 450-char` single lines); if `SKILL.md` approaches `38,000 bytes`, require offloading existing prose rules into deterministic `scripts/` checks or pruning redundant prose.
+   - **Schema-Mutating `stdout` Compaction Cascades**: Reject any script change that compacts `stdout` by conditionally deleting dictionary keys (`lat`, `lon`, `bearing_deg`, `in_fov`, `clearance_deg`, `occluded_by`, `federal_lands`) across multi-level compaction tiers. Every item in a JSON list must maintain a **fixed, invariant key schema**; `stdout` byte caps (`<= 5.4 KB`) must be enforced strictly by slicing array lengths and writing full arrays to `--out-json`.
    - **Cross-Step / Cross-Skill Workflow Deadlocks & Data Starvation**: Does combining two recommendations (e.g., compacting `send_message` while also stripping an output field from a companion script, while forbidding `read_file` on a staging file) starve the parent orchestrator or break a downstream phase?
    - **Overly Rigid Blanket Bans**: Does a proposed rule (e.g., banning separate `--overview` and `--box` crop calls, or forcing a narrow `--types` filter on initial discovery) break legitimate edge cases or poison a shared cache?
    - **CLI `argparse` & Backward-Compatibility Collisions**: Does a proposed CLI flag or `nargs="+"` change conflict with existing flags (e.g., `--az-min`/`--az-max` sector bounds vs. post-hoc filters), break existing `bearing,x_frac` delimiter parsing, or fail because another argument is still `required=True`?
@@ -334,8 +297,8 @@ Once `<findings-dir>/recommendations_final.md` is written, apply all recommendat
 
    ### Implementation & Sanity-Check Requirements:
    1. Implement every requirement in `<Group X>` accurately, including all technical review safeguards.
-   2. If editing a `SKILL.md` file, check its final byte size (`(Get-Item "<path>").Length`) and ensure it remains comfortably below the `46,080-byte` `read_file` truncation limit (ideally `< 42,000–44,000 bytes`) so future subagents can read `SKILL.md` in a single `read_file` call.
-   3. If editing Python scripts, run syntax and CLI smoke tests (`python -m py_compile`, `--help`, and targeted subcommand tests with `BypassSandbox: true` if network/ExifTool is used), and clean up any temporary test files.
+   2. If editing a `SKILL.md` file, check its final byte size (`(Get-Item "<path>").Length`) and ensure it remains `<= 38,000 bytes` (comfortably below the `46,080-byte` `read_file` truncation limit) with clean, readable multi-line bullets (never packing multiple rules into `> 450-char` single-line walls of text or including hike-specific landmark names).
+   3. If editing Python scripts, keep JSON item schemas invariant across `stdout` compaction (slicing array lengths rather than dropping keys), run syntax and CLI smoke tests (`python -m py_compile`, `--help`, and targeted subcommand tests with `BypassSandbox: true` if network/ExifTool is used), and clean up any temporary test files.
    4. Reply to the main agent with a concise summary of all changes applied and line numbers updated.
    ```
 
@@ -370,41 +333,41 @@ Never rely solely on the implementation subagents' self-reports. Once Step 5A co
 Every Trajectory Inspector Subagent in Step 1 must evaluate its assigned trajectory(s) across all seven dimensions below, linking every finding to concrete trajectory evidence (`[<short-id>](conversation://<id>)`, step indices) and the specific flaw or omission in `SKILL.md` or `scripts/`:
 
 ### 1. Failed Tool Calls, Syntax Thrashing & Error-Recovery Loops
-- **Host Shell & Quote-Escaping Failures**: `ParserError`, `SyntaxError`, or mangled arguments in `run_command` (nested quotes in inline `python -c "..."`, `exiftool`, or PowerShell escaping). *Fix*: Ban inline `python -c` and provide CLI flags in `scripts/`.
-- **Blind Retry & Brute-Force Tinkering Loops**: 3+ consecutive tool calls mutating CLI flags (`argparse` `unrecognized arguments`, comma- vs. space-separated list args) or file paths by trial and error. *Fix*: Harden `argparse` (e.g., accept both `nargs="+"` space-separated and comma-separated args) and document exact CLI templates.
-- **Environment, Path & Sandbox Assumptions**: `FileNotFoundError`, `PermissionError` inside the Windows sandbox (e.g., `WindowsApps\python.exe` blocked, network calls blocked, or `<appDataDir>/brain/` restricted when `BypassSandbox: false`). *Fix*: Unify `BypassSandbox: true` rules in `SKILL.md` so agents don't suffer 1-step sandbox failures.
-- **Silent or Unhandled Tool Degradation**: Commands exiting `0` with empty/partial data (e.g., Overpass HTTP 200 soft runtime timeouts `"remark": "runtime error..."`, missing USGS layers, or un-retried tile export timeouts) that poison disk caches or trigger 30-step custom scripting spirals. *Fix*: Detect soft timeouts, add parallel authoritative fallbacks, and track per-provider completeness in cache files.
+- **Host Shell & Quote-Escaping Failures**: `ParserError`, `SyntaxError`, or mangled arguments in `run_command` (e.g., `&&` in Windows PowerShell 5.1, nested quotes in inline `python -c "..."`, or unescaped shell characters). *Fix*: Ban `&&`/`;` chaining and inline `python -c`, and provide clean CLI flags in `scripts/`.
+- **Blind Retry & Brute-Force Tinkering Loops**: 3+ consecutive tool calls mutating CLI flags (`argparse` `unrecognized arguments`, comma- vs. space-separated list args) or file paths by trial and error. *Fix*: Harden `argparse` (accept both `nargs="+"` space-separated and comma-separated args) and document exact CLI templates.
+- **Environment, Path & Sandbox Assumptions**: `FileNotFoundError` or `PermissionError` inside the Windows sandbox (e.g., `WindowsApps\python.exe` blocked, network calls blocked, or `<appDataDir>/brain/` restricted when `BypassSandbox: false`). *Fix*: Unify `BypassSandbox: true` rules in `SKILL.md` so agents avoid 1-step sandbox failures.
+- **Silent or Unhandled Tool Degradation**: Commands exiting `0` with empty/partial data (e.g., API soft timeouts or un-retried export timeouts) that poison disk caches or trigger custom scripting spirals. *Fix*: Detect soft timeouts, add parallel authoritative fallbacks, and track per-provider completeness and negative-cache cooldowns in cache files.
 
 ### 2. Unnecessary, Redundant & Inefficient Tool Calls
-- **Trivial Print Probes & Mental-Math Spawns**: Running `python -c "print(...)"` for scalar unit conversions (`ft` to `m`, `°F` to `°C`) or simple arithmetic. *Fix*: Pre-compute dual units and deltas in `scripts/` and mandate internal mental math for simple scalars.
-- **Unbatched / Fragmented Tool Execution**: Running `--overview` and `--box` in separate `crop_photo.py` calls, or calling `write_file` in one turn and `send_message` in the next turn (adding a 60k–85k token turn). *Fix*: Mandate single-call batching for crops and single-turn `write_file` + `send_message`.
+- **Trivial Print Probes & Mental-Math Spawns**: Running `python -c "print(...)"` for scalar unit conversions or simple arithmetic. *Fix*: Pre-compute conversions/deltas in `scripts/` and mandate internal mental math for simple scalars.
+- **Unbatched / Fragmented Tool Execution**: Spawning separate processes for operations that can be batched in a single CLI call, or calling `write_file` in one turn and `send_message` in the next turn (adding an extra peak-context turn). *Fix*: Mandate single-call batching and single-turn `write_file` + `send_message`.
 - **Redundant File Reads & 2-Part `SKILL.md` Truncation Splits**:
-  - If `SKILL.md` exceeds `46,080 bytes` (`read_file`'s per-call byte limit), 100% of subagents are forced to spend an extra turn calling `read_file` with `ByteOffset=46080`. *Fix*: Keep every `SKILL.md` under `< 42,000–44,000 bytes`.
-  - Reading raw `<photo_stem>_skyline.json` or `<photo_stem>_nearby.json` via `read_file` (injecting `+15k` to `+66k` context tokens). *Fix*: Ban `read_file` on raw JSON dumps and provide fast CLI filter flags (`--types`, `--az-min`, `--az-max`, `--search`).
-- **Ad-Hoc Script Reinvention**: Writing custom `.py` scripts in `scratch/` across $\ge 2$ trajectories for the same domain calculation (e.g., forward `x_frac -> bearing` projection, lunar ephemeris, JSON filtering). *Fix*: Promote recurring ad-hoc logic into `scripts/`.
+  - If `SKILL.md` exceeds `46,080 bytes` (`read_file`'s per-call byte limit), 100% of subagents are forced to spend an extra turn calling `read_file` with `ByteOffset=46080`. *Fix*: Keep every `SKILL.md` under `<= 38,000 bytes` by offloading checks to `scripts/` and stating each rule in at most one section (never by packing 1,000+ character walls of text onto single lines).
+  - Reading large raw JSON dumps via `read_file` (injecting `+15k` to `+66k` context tokens). *Fix*: Ban `read_file` on raw JSON dumps and provide fast CLI filter flags.
+- **Ad-Hoc Script Reinvention**: Writing custom `.py` scripts in `scratch/` across $\ge 2$ trajectories for the same domain calculation. *Fix*: Promote recurring ad-hoc logic into `scripts/`.
 
 ### 3. Confirmation Bias, Anchoring & Motivated Reasoning
-- **Premature Hypothesis Locking (Narrative Anchoring)**: Deciding what a feature/cause is *before* collecting objective data, or anchoring on an adjacent photo's location when EXIF GPS is `null` (`elapsed_time_min > 15`). *Fix*: Enforce geometry-first discovery, with an explicit exception to check `post.md` when EXIF GPS is missing and cannot be interpolated within `<= 15 minutes`.
-- **One-Sided Information Retrieval**: Querying only one preconceived direction/name instead of a 360° candidate inventory.
-- **Post-Hoc Rationalization of Contradictory Evidence**: Inventing excuses in `thinking` when tool output (solar azimuth/shadow angles, DEM line-of-sight occlusion, elevation) contradicts the model's hypothesis. *Fix*: Frame physical/geometric checks as **hard falsification gates** with zero rationalization permitted.
-- **Uncorroborated Visual or Historical Extrapolation**: Hallucinating close-up botanical morphology from distant wide-angle shots, or inventing contradictory historical place-name etymologies, climber attributions, or dates from LLM memory without `post.md` or `search_web`.
+- **Premature Hypothesis Locking (Narrative Anchoring)**: Deciding what an answer/feature is *before* collecting objective data, or anchoring on an adjacent item's metadata when primary metadata is missing. *Fix*: Enforce data/geometry-first discovery before reading narrative drafts, with explicit fallback guidance when primary metadata is missing.
+- **One-Sided Information Retrieval**: Querying only one preconceived candidate or direction instead of a full candidate inventory.
+- **Post-Hoc Rationalization of Contradictory Evidence**: Inventing excuses in `thinking` when tool output contradicts the model's hypothesis. *Fix*: Frame objective tool checks as **hard falsification gates** with zero rationalization permitted.
+- **Uncorroborated Extrapolation**: Hallucinating fine visual details from coarse views, or inventing unverified historical etymologies, attributions, or dates from LLM memory without source verification.
 
 ### 4. Goal-Driven Obsession, Reward Hacking & Premature Completion
-- **Satisficing & Silent Fabrication**: Hardcoding coordinates from LLM memory when a feature type (`PopulatedPlace`, `Lake`) is missing from tool output, or copying example peak elevations from `SKILL.md` (e.g., `University Peak 13,604 ft`) when absent from `post.md` and `--ref-elev-ft`. *Fix*: Add missing feature types to tools and de-bias hardcoded examples in `SKILL.md`.
-- **Superficial Template Compliance vs. Constraint Neglect**: Violating editorial rules—such as using em-dashes `—` instead of spaced en-dashes ` – `, omitting dual units on spelled-out distances (`"twenty miles"`), grouping half-bare ranges (`0.5 – 3.9 mi / 0.8 – 6.3 km`), leaking internal image coordinates (`x = 0.65`), or using degree symbols (`°`). *Fix*: Add deterministic regex validation in `catalog_tools.py` / `scripts/` and explicit negative examples in `SKILL.md`.
-- **Sycophancy & Uncritical Acceptance of Flawed Premises**: Failing to flag factual or directional discrepancies in the user's draft `post.md`.
+- **Satisficing & Silent Fabrication**: Hardcoding data from LLM memory when a category is missing from tool output, or copying example values from `SKILL.md` when absent from the active inputs. *Fix*: Add missing categories to tools and use generic placeholder names (`Granite Peak`, `Twin Lakes`) in `SKILL.md` examples.
+- **Superficial Template Compliance vs. Constraint Neglect**: Violating editorial rules (e.g., forbidden punctuation, missing dual units, or leaked internal coordinates/field names). *Fix*: Add deterministic regex auto-normalization and validation in `scripts/` rather than repeating prose warnings across `SKILL.md`.
+- **Sycophancy & Uncritical Acceptance of Flawed Premises**: Failing to flag factual discrepancies in the user's draft or input benchmarks. *Fix*: Pre-validate input benchmarks in `scripts/` and emit structured warning fields.
 
 ### 5. Context Window Bloat, Compression Amnesia & Instruction Drift
-- **Stdout Truncation & Context Pollution**: Tool `stdout` exceeding `~8–10 KB` gets mid-truncated by the `run_command` harness, hiding critical arrays (`dem_horizon_highpoints`, `foreground_ridges`, or `extract_metadata.py` fields when 25 `--ref-elev-ft` flags are passed) and triggering custom JSON-parsing scripts. *Fix*: Reorder highest-signal JSON keys first and compact `stdout` (`< 4.5–5.5 KB`) when `--out-json` is passed while writing the full dataset to disk.
+- **Stdout Truncation & Context Pollution**: Tool `stdout` exceeding `~8–10 KB` gets mid-truncated by the `run_command` harness, hiding critical arrays and triggering custom JSON-parsing scripts. *Fix*: Reorder highest-signal JSON keys first and compact `stdout` (`< 4.5–5.5 KB`) by slicing array lengths while keeping item dictionary schemas 100% fixed and writing the full dataset to `--out-json`.
 - **Context Compression Amnesia**: After a context compression drop, the agent forgets procedural rules, re-reads `SKILL.md` repeatedly, or collapses subagent roles. *Fix*: Offload per-item work to isolated subagents and provide post-compaction recovery rules.
-- **Late-Trajectory Constraint Decay & Shared-File Contention**: Repeatedly reading/editing a monolithic `catalog.md` across turns. *Fix*: Stage per-item outputs to isolated `scratch/<item>_entry.md` files and use atomic CLI `upsert` / `placements` subcommands.
+- **Late-Trajectory Constraint Decay & Shared-File Contention**: Repeatedly reading/editing a monolithic output file across turns. *Fix*: Stage per-item outputs to isolated `scratch/<item>_entry.md` files and use atomic CLI `upsert` / `status` subcommands.
 
 ### 6. Subagent Orchestration & Cross-Skill Handoff Pathologies
-- **Under-Specified Delegation Prompts**: Parent agent omitting sequential context (`--prev-photo`, `--next-photo`, `--tcx`, corridor `--ref-elev-ft` benchmarks, or Windows `BypassSandbox: true` rules). *Fix*: Define a canonical **Subagent Invocation Prompt Template** in the parent skill.
-- **System Prompt `<subagent_reminder>` vs. `SKILL.md` Contradictions**: Forbidding `send_message` in `SKILL.md` when the runtime injects `<subagent_reminder>` requiring `send_message`, or requiring `send_message` to duplicate a 6 KB markdown entry already written via `write_file`. *Fix*: Instruct subagents to call `write_file` and `send_message` in the same final turn, sending only a compact completion summary in `send_message`.
+- **Under-Specified Delegation Prompts**: Parent agent omitting required CLI flags, shared benchmarks, or Windows `BypassSandbox: true` rules. *Fix*: Define a canonical **Subagent Invocation Prompt Template** in the parent skill.
+- **System Prompt `<subagent_reminder>` vs. `SKILL.md` Contradictions**: Forbidding `send_message` in `SKILL.md` when the runtime injects `<subagent_reminder>` requiring `send_message`, or requiring `send_message` to duplicate a large markdown entry already written via `write_file`. *Fix*: Instruct subagents to call `write_file` and `send_message` in the same final turn, sending only a compact completion summary in `send_message` with zero subsequent tool calls.
 - **Cross-Skill Contradictions & Reviving Canceled Subagents**: Contradictory rules between parent and child skills, or messaging a user-canceled subagent instead of spawning a fresh subagent.
 - **Polling Loops**: Calling `manage_task` or `manage_subagents` (`status`/`list`) in a loop instead of relying on reactive wakeup.
 
 ### 7. Skill Description Flaws, Ambiguities & User-Correction Signals
-- **User Corrections as Ground-Truth Indictments**: Every user intervention in `User Turns` must be traced to the exact omission or ambiguity in `SKILL.md` or defect in `scripts/`.
-- **Vague Directives vs. Deterministic Guardrails**: Replace subjective prose (*"be concise"*, *"check units"*) with hard caps, exact CLI templates, and automated pre-flight/post-flight script checks.
+- **User Corrections vs. One-Off Curiosity**: Trace systemic user corrections in `User Turns` to the underlying omission in `SKILL.md` or defect in `scripts/`, but never turn a one-off user follow-up question about a unique subject (`N=1`) into a hike-specific or subject-specific rule in `SKILL.md`.
+- **Code-Over-Prompt Guardrails**: Replace subjective or repetitive prose (*"be concise"*, *"check units"*, manual benchmark sanity math) with automated pre-flight/post-flight script checks and auto-normalization.
