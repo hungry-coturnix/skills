@@ -158,10 +158,11 @@ def normalize_entry_block(raw_text: str) -> Tuple[str, str]:
     full_entry = strip_outer_fences_and_dividers(normalized_header + body_after_header)
 
     # Auto-normalize forbidden em-dashes, measurement backticks, malformed bold spacing,
-    # and trailing periods after DMS GPS coordinates at the end of Suggested Caption
+    # missing space after nested bullet hyphens, and trailing periods after DMS GPS coordinates
     full_entry = re.sub(r"[ \t]*—[ \t]*", " – ", full_entry)
     full_entry = BACKTICK_MEASUREMENT_RE.sub(r"\1", full_entry)
     full_entry = re.sub(r"(?<=\s)\*\*[ \t]+([^\n*]+?)\*\*", r"**\1**", full_entry)
+    full_entry = re.sub(r"(?m)^([ \t]*)-(?=\*\*|[A-Za-z~\"'])", r"\1- ", full_entry)
     full_entry = CAPTION_TRAILING_PERIOD_DMS_RE.sub(r"\1. \2", full_entry)
     full_entry = CAPTION_DUP_PERIOD_DMS_RE.sub(r"\1", full_entry)
 
@@ -716,7 +717,7 @@ def cmd_upsert(args: argparse.Namespace) -> None:
 
 def _compact_location_for_stdout(loc: str, max_len: int = 45) -> str:
     short = re.split(
-        r",\s*(?:Pacific\s+Crest\s+Trail|John\s+Muir\s+Trail|Sequoia-Kings|Kings\s+Canyon|Inyo\s+National|John\s+Muir\s+Wilderness|Fresno\s+County|Inyo\s+County)",
+        r",\s*(?:[^,]*?\b(?:Wilderness|National\s+Park|National\s+Forest|State\s+Park|County)\b)",
         loc,
         maxsplit=1,
         flags=re.IGNORECASE,

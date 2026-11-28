@@ -957,18 +957,52 @@ def main():
     elevation_str = f"{chosen_ft:,} ft / {chosen_m:,} m" if chosen_ft is not None else "[Not available]"
 
     elevation_deltas = {}
-    if chosen_ft is not None and args.ref_elev_ft:
+    benchmark_warnings = {}
+    nearby_for_benchmarks = None
+    if args.ref_elev_ft and raw_lat is not None and raw_lon is not None:
+        try:
+            gt = _import_geo_tools()
+            if gt is not None and hasattr(gt, "find_nearby_features"):
+                nearby_for_benchmarks = gt.find_nearby_features(raw_lat, raw_lon, radius_km=25.0)
+        except Exception:
+            nearby_for_benchmarks = None
+
+    if args.ref_elev_ft:
         for ref_item in args.ref_elev_ft:
             label = "reference"
             val_str = str(ref_item)
             if ":" in val_str:
                 label, val_str = val_str.split(":", 1)
+            label = label.strip()
             try:
-                ref_ft = float(val_str.replace(",", ""))
-                diff_ft = round(chosen_ft - ref_ft)
-                diff_m = round(diff_ft * 0.3048)
-                direction = "above" if diff_ft >= 0 else "below"
-                elevation_deltas[f"{label} ({round(ref_ft):,} ft)"] = f"~{abs(diff_ft):,} ft / {abs(diff_m):,} m {direction}"
+                ref_ft = float(val_str.replace(",", "").strip())
+                ref_ft_round = round(ref_ft)
+                if chosen_ft is not None:
+                    diff_ft = round(chosen_ft - ref_ft)
+                    diff_m = round(diff_ft * 0.3048)
+                    direction = "above" if diff_ft >= 0 else "below"
+                    elevation_deltas[f"{label} ({ref_ft_round:,} ft)"] = f"~{abs(diff_ft):,} ft / {abs(diff_m):,} m {direction}"
+
+                if nearby_for_benchmarks and label and label.lower() not in ("reference", "trailhead", "start", "end", "camp", "high point"):
+                    lbl_low = label.lower()
+                    matched_feat = None
+                    for nf in nearby_for_benchmarks:
+                        nf_name = str(nf.get("name") or "").strip()
+                        if nf_name.lower() == lbl_low and nf.get("elevation_ft") is not None:
+                            matched_feat = nf
+                            break
+                    if matched_feat is not None:
+                        dem_ft = int(round(float(matched_feat["elevation_ft"])))
+                        dem_m = int(round(dem_ft * 0.3048))
+                        ftype = str(matched_feat.get("type") or "Feature")
+                        delta_vs_dem = ref_ft_round - dem_ft
+                        max_pos_diff = 250 if ftype in ("Summit", "Peak", "Pillar", "Cliff") else 150
+                        if delta_vs_dem < -30 or delta_vs_dem > max_pos_diff:
+                            benchmark_warnings[label] = (
+                                f"Benchmark '{label}:{ref_ft_round}' differs from local USGS/3DEP {ftype} "
+                                f"'{matched_feat['name']}' ({dem_ft:,} ft / {dem_m:,} m) by {delta_vs_dem:+d} ft; "
+                                f"use {dem_ft:,} ft / {dem_m:,} m and flag discrepancy in Suggested Draft Placement."
+                            )
             except ValueError:
                 pass
 
@@ -1022,46 +1056,22 @@ def main():
     })
     if elevation_deltas:
         result["elevation_deltas"] = elevation_deltas
+    if benchmark_warnings:
+        result["benchmark_warnings"] = benchmark_warnings
 
+    # Keep all dictionary schemas 100% consistent; if stdout exceeds 4,000 bytes, cap stop array length only
     out_str = format_compact_json(result)
-    if len(out_str.encode("utf-8")) > 3450:
+    if len(out_str.encode("utf-8")) > 4000:
         prev_fn = prev_photo.get("filename") if isinstance(prev_photo, dict) else None
         next_fn = next_photo.get("filename") if isinstance(next_photo, dict) else None
-        result["prev_hike_stops"] = [
-            {k: v for k, v in s.items() if k not in ("lat", "lon")}
-            for s in (prev_hike_stops or [])
-            if s.get("file") != prev_fn
-        ][:2]
-        result["next_hike_stops"] = [
-            {k: v for k, v in s.items() if k not in ("lat", "lon")}
-            for s in (next_hike_stops or [])
-            if s.get("file") != next_fn
-        ][:2]
-        out_str = format_compact_json(result)
-
-    if len(out_str.encode("utf-8")) > 3450:
-        result["prev_hike_stops"] = [
-            {k: v for k, v in s.items() if k not in ("lat", "lon", "bearing_deg")}
-            for s in result.get("prev_hike_stops", [])[:1]
-        ]
-        result["next_hike_stops"] = [
-            {k: v for k, v in s.items() if k not in ("lat", "lon", "bearing_deg")}
-            for s in result.get("next_hike_stops", [])[:1]
-        ]
-        if isinstance(result.get("admin_boundaries"), dict):
-            ab = dict(result["admin_boundaries"])
-            if ab.get("national_park") or ab.get("wilderness") or ab.get("national_forest"):
-                ab.pop("federal_lands", None)
-            result["admin_boundaries"] = ab
-        out_str = format_compact_json(result)
-
-    if len(out_str.encode("utf-8")) > 3450:
-        if result.get("panorama_guidance") is None:
-            result.pop("panorama_guidance", None)
-        if result.get("ground_elevation_ft") is not None:
-            result.pop("exif_elevation_ft", None)
-            result.pop("exif_elevation_m", None)
-        out_str = format_compact_json(result)
+        dedup_prev = [s for s in (prev_hike_stops or []) if s.get("file") != prev_fn]
+        dedup_next = [s for s in (next_hike_stops or []) if s.get("file") != next_fn]
+        for max_stops in (2, 1):
+            result["prev_hike_stops"] = dedup_prev[:max_stops]
+            result["next_hike_stops"] = dedup_next[:max_stops]
+            out_str = format_compact_json(result)
+            if len(out_str.encode("utf-8")) <= 4000:
+                break
 
     print(out_str)
 

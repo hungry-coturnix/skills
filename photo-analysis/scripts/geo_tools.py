@@ -3552,103 +3552,35 @@ def _reorder_skyline_dict(res):
     return out
 
 
-def _compact_skyline_item(item, level, is_hp=False):
+def _compact_skyline_item(item, level=1, is_hp=False):
+    """
+    Returns a clean, fixed-schema dict for stdout (omitting duplicate alias keys and None values,
+    while never dropping documented geometric or coordinate fields across compaction passes).
+    """
     if level <= 0 or not isinstance(item, dict):
         return item
     is_unnamed_hp = is_hp and str(item.get("matched_named_feature", "")).startswith("Unnamed")
-    if level == 1:
-        drop = {
-            "geometry_type", "expected_x_px", "projected_x_px", "source",
-            "horizon_distance_mi", "horizon_distance_km",
-            "horizon_elevation_ft", "horizon_elevation_m", "occluding_lat", "occluding_lon",
-            "azimuth_deg", "vertical_angle_deg", "distance_km", "elevation_m", "matched_feature",
-        }
-        if not is_unnamed_hp:
-            drop.update(("lat", "lon"))
-        out_d = {}
-        for k, v in item.items():
-            if k in drop:
-                if k == "azimuth_deg" and "bearing_deg" not in item:
-                    out_d["azimuth_deg"] = v
-                elif k == "vertical_angle_deg" and "target_vertical_angle_deg" not in item:
-                    out_d["vertical_angle_deg"] = v
-                continue
-            out_d[k] = v
-        return out_d
-    # level == 2: compact stdout representation (full fields + aliases remain in --out-json)
-    if level == 2:
-        keep_order = (
-            "name", "type", "bearing_deg", "azimuth_deg", "cardinal",
-            "distance_mi", "elevation_ft", "target_vertical_angle_deg", "vertical_angle_deg",
-            "clearance_deg", "in_fov", "projected_x_fraction",
-            "line_of_sight", "visibility_class", "highest_intervening_ridge", "occluded_by",
-            "matched_named_feature", "nearest_named_feature", "lat", "lon",
-        ) if is_unnamed_hp else (
-            "name", "type", "bearing_deg", "azimuth_deg", "cardinal",
-            "distance_mi", "elevation_ft", "target_vertical_angle_deg", "vertical_angle_deg",
-            "clearance_deg", "in_fov", "projected_x_fraction",
-            "line_of_sight", "visibility_class", "highest_intervening_ridge", "occluded_by",
-            "matched_named_feature", "nearest_named_feature",
-        )
-        out_d = {}
-        for k in keep_order:
-            if k in item and item[k] is not None:
-                if k == "azimuth_deg" and "bearing_deg" in out_d:
-                    continue
-                if k == "vertical_angle_deg" and "target_vertical_angle_deg" in out_d:
-                    continue
-                if k == "line_of_sight" and item[k] == "VISIBLE":
-                    continue
-                if k == "visibility_class" and item[k] in ("CLEARLY_VISIBLE", "OCCLUDED"):
-                    continue
-                if is_hp and k == "nearest_named_feature" and not is_unnamed_hp:
-                    continue
-                out_d[k] = item[k]
-        return out_d
-    # level >= 3: tightest stdout representation to guarantee <= 5,400 chars
-    keep_order_tight = (
-        "name", "type", "bearing_deg", "azimuth_deg",
-        "distance_mi", "elevation_ft", "vertical_angle_deg", "target_vertical_angle_deg",
+    keep_order = (
+        "name", "type", "bearing_deg", "azimuth_deg", "cardinal",
+        "distance_mi", "distance_km", "elevation_ft", "elevation_m",
+        "target_vertical_angle_deg", "vertical_angle_deg",
         "clearance_deg", "in_fov", "projected_x_fraction",
         "line_of_sight", "visibility_class", "highest_intervening_ridge", "occluded_by",
         "matched_named_feature", "nearest_named_feature", "lat", "lon",
-    ) if is_unnamed_hp else (
-        "name", "type", "bearing_deg", "azimuth_deg",
-        "distance_mi", "elevation_ft", "vertical_angle_deg", "target_vertical_angle_deg",
-        "clearance_deg", "in_fov", "projected_x_fraction",
-        "line_of_sight", "visibility_class", "highest_intervening_ridge", "occluded_by",
-        "matched_named_feature", "nearest_named_feature",
     )
     out_d = {}
-    for k in keep_order_tight:
+    for k in keep_order:
         if k in item and item[k] is not None:
-            if k == "type" and item[k] == "CheckPoint":
-                continue
             if k == "azimuth_deg" and "bearing_deg" in out_d:
                 continue
-            if k == "target_vertical_angle_deg" and "vertical_angle_deg" in out_d:
+            if k == "vertical_angle_deg" and "target_vertical_angle_deg" in out_d:
                 continue
-            if k == "line_of_sight" and item[k] in ("VISIBLE", "OCCLUDED"):
+            if is_hp and k == "nearest_named_feature" and not is_unnamed_hp:
                 continue
-            if k == "visibility_class" and item[k] in ("CLEARLY_VISIBLE", "OCCLUDED"):
-                continue
-            if level >= 4 and k == "highest_intervening_ridge" and item.get("visibility_class") != "GRAZING_TIP_ONLY":
-                continue
-            if level >= 5:
-                if k == "projected_x_fraction" and not item.get("in_fov", True):
-                    continue
-                if k == "in_fov" and not item[k]:
-                    continue
-                if k == "occluded_by" and isinstance(item[k], dict):
-                    out_d[k] = {
-                        ok: item[k][ok]
-                        for ok in ("distance_mi", "elevation_ft")
-                        if ok in item[k] and item[k][ok] is not None
-                    }
-                    continue
-            if is_hp and k == "nearest_named_feature" and (not is_unnamed_hp or level >= 5):
-                continue
-            out_d[k] = item[k]
+            if k in ("lat", "lon"):
+                out_d[k] = round(float(item[k]), 5)
+            else:
+                out_d[k] = item[k]
     return out_d
 
 
@@ -3671,7 +3603,7 @@ def _build_skyline_stdout(res, out_json_path=None, verbose=False):
         fov_plus_10 = list(all_occ)
 
     # Prioritize in_fov: true features ahead of in_fov: false margin features,
-    # and rank nearby named corridor landmarks (<= 3.5 mi) ahead of distant 14ers and unnamed tarns
+    # and rank nearby named corridor landmarks (<= 3.5 mi) ahead of distant summits and unnamed tarns
     in_fov_occ = [o for o in fov_plus_10 if o.get("in_fov", True)]
     out_fov_occ = [o for o in fov_plus_10 if not o.get("in_fov", True)]
 
@@ -3803,10 +3735,7 @@ def _build_skyline_stdout(res, out_json_path=None, verbose=False):
         selected.sort(key=_bearing_sort_key)
         return selected
 
-    def _compact_dict(item, level, is_hp=False):
-        return _compact_skyline_item(item, level, is_hp=is_hp)
-
-    def _assemble(occ_slice, top360_slice, level=0, max_vis=None, max_hp=None, max_fg=None):
+    def _assemble(occ_slice, top360_slice, max_vis=None, max_hp=None, max_fg=None, max_cc=None):
         vis_raw = _select_balanced_fov(res.get("visible_features_in_fov", []), max_vis)
         hp_raw = _select_balanced_fov(res.get("dem_horizon_highpoints", []), max_hp)
         fg_raw = res.get("foreground_ridges", [])
@@ -3815,27 +3744,25 @@ def _build_skyline_stdout(res, out_json_path=None, verbose=False):
 
         occ_sorted = sorted(occ_slice, key=_bearing_sort_key)
 
-        vis_list = [_compact_dict(item, level) for item in vis_raw]
-        hp_list = [_compact_dict(item, level, is_hp=True) for item in hp_raw]
-        fg_list = [_compact_dict(item, level) for item in fg_raw]
-        occ_list = [_compact_dict(item, level) for item in occ_sorted]
-        top360_list = [_compact_dict(item, level) for item in top360_slice]
+        vis_list = [_compact_skyline_item(item, level=1) for item in vis_raw]
+        hp_list = [_compact_skyline_item(item, level=1, is_hp=True) for item in hp_raw]
+        fg_list = [_compact_skyline_item(item, level=1) for item in fg_raw]
+        occ_list = [_compact_skyline_item(item, level=1) for item in occ_sorted]
+        top360_list = [_compact_skyline_item(item, level=1) for item in top360_slice]
 
-        fov_out = res.get("fov")
-        if level >= 5 and isinstance(fov_out, dict) and "note" in fov_out:
-            fov_out = {k: v for k, v in fov_out.items() if k != "note"}
         out_stdout = {
             "camera": res.get("camera"),
-            "fov": fov_out,
+            "fov": res.get("fov"),
         }
+        if out_json_path:
+            out_stdout["out_json"] = os.path.abspath(out_json_path)
         if "dem_warning" in res:
             out_stdout["dem_warning"] = res["dem_warning"]
         if "checked_coords_visibility" in res:
-            cc_lvl = max(1, level)
-            if len(res["checked_coords_visibility"]) >= 8 and level >= 3:
-                cc_lvl = 5 if (len(res["checked_coords_visibility"]) >= 10 or level >= 4) else 4
+            cc_all = res["checked_coords_visibility"]
+            cc_slice = cc_all[:max_cc] if max_cc is not None else cc_all
             out_stdout["checked_coords_visibility"] = [
-                _compact_dict(item, cc_lvl) for item in res["checked_coords_visibility"]
+                _compact_skyline_item(item, level=1) for item in cc_slice
             ]
         out_stdout["visible_features_in_fov"] = vis_list
         out_stdout["dem_horizon_highpoints"] = hp_list
@@ -3850,32 +3777,23 @@ def _build_skyline_stdout(res, out_json_path=None, verbose=False):
         return out_stdout
 
     top360_full = res.get("top_dominant_360_visible_summits", [])
-    min_occ_keep = min(5, len(picked_occ))
-    for occ_n, top_n, lvl, mv, mhp, mfg in (
-        (12, len(top360_full), 0, None, None, None),
-        (12, 8, 1, None, None, None),
-        (12, 6, 2, None, None, None),
-        (8, 5, 2, None, None, None),
-        (max(6, min_occ_keep), 5, 3, None, None, None),
-        (max(5, min_occ_keep), 4, 3, 14, 12, 4),
-        (max(5, min_occ_keep), 3, 3, 12, 11, 4),
-        (max(5, min_occ_keep), 3, 3, 10, 10, 3),
-        (max(5, min_occ_keep), 2, 4, 9, 10, 3),
-        (max(5, min_occ_keep), 2, 4, 8, 9, 2),
-        (4, 2, 4, 7, 8, 2),
-        (3, 2, 4, 6, 7, 1),
-        (2, 1, 4, 4, 5, 1),
-        (2, 1, 5, 3, 4, 1),
-        (1, 1, 5, 2, 3, 0),
-        (1, 0, 5, 1, 1, 0),
+    min_occ_keep = min(4, len(picked_occ))
+    for occ_n, top_n, mv, mhp, mfg, mcc in (
+        (10, len(top360_full), None, None, None, None),
+        (8, 6, 14, 12, 4, 12),
+        (6, 5, 11, 10, 3, 10),
+        (max(4, min_occ_keep), 4, 9, 9, 2, 8),
+        (max(3, min_occ_keep), 3, 7, 7, 2, 6),
+        (2, 2, 5, 6, 1, 5),
+        (2, 1, 4, 4, 1, 4),
     ):
         cand_stdout = _assemble(
             picked_occ[:occ_n],
             top360_full[:top_n],
-            level=lvl,
             max_vis=mv,
             max_hp=mhp,
             max_fg=mfg,
+            max_cc=mcc,
         )
         if len(format_compact_json(cand_stdout)) <= 5400:
             return cand_stdout
@@ -3899,22 +3817,18 @@ def _build_nearby_stdout(full_features, filtered_features, out_json_path=None, v
             if float(f.get("distance_km", 999.0)) <= 5.0 or f.get("type") in major_types
         ]
 
-    def _make_summary(feat_slice, strip_source=False, round_coords=False, compact_keys=False, ultra_compact=False):
+    def _make_summary(feat_slice):
+        keep = (
+            "name", "type", "distance_mi", "distance_km", "bearing_deg",
+            "cardinal", "elevation_ft", "elevation_m", "lat", "lon",
+        )
         items = []
         for item in feat_slice:
-            if ultra_compact:
-                keep = ("name", "type", "distance_mi", "bearing_deg", "elevation_ft", "lat", "lon")
-                d = {k: item[k] for k in keep if k in item and item[k] is not None}
-            elif compact_keys:
-                keep = ("name", "type", "distance_mi", "distance_km", "bearing_deg", "cardinal", "elevation_ft", "elevation_m", "lat", "lon")
-                d = {k: item[k] for k in keep if k in item and item[k] is not None}
-            else:
-                d = {k: v for k, v in item.items() if (not strip_source or k != "source")}
-            if round_coords or compact_keys or ultra_compact:
-                if d.get("lat") is not None:
-                    d["lat"] = round(float(d["lat"]), 5)
-                if d.get("lon") is not None:
-                    d["lon"] = round(float(d["lon"]), 5)
+            d = {k: item[k] for k in keep if k in item and item[k] is not None}
+            if d.get("lat") is not None:
+                d["lat"] = round(float(d["lat"]), 5)
+            if d.get("lon") is not None:
+                d["lon"] = round(float(d["lon"]), 5)
             items.append(d)
         out_summary = {}
         if out_json_path:
@@ -3953,24 +3867,10 @@ def _build_nearby_stdout(full_features, filtered_features, out_json_path=None, v
 
     beyond_3km = [f for f in retained if float(f.get("distance_km", 999.0)) > 3.0]
 
-    # When unfiltered retained fits within 5,450 chars AND doesn't have > 3 minor local features crowding the list, emit directly
-    if not within_3km_excess_minor:
-        summary = _make_summary(retained, strip_source=False)
-        if len(format_compact_json(summary)) <= 5450:
-            return summary
-
-        summary = _make_summary(retained, strip_source=True, round_coords=True)
-        if len(format_compact_json(summary)) <= 5450:
-            return summary
-    else:
-        capped_retained = within_3km_primary + beyond_3km
-        summary = _make_summary(capped_retained, strip_source=False)
-        if len(format_compact_json(summary)) <= 5450:
-            return summary
-
-        summary = _make_summary(capped_retained, strip_source=True, round_coords=True)
-        if len(format_compact_json(summary)) <= 5450:
-            return summary
+    base_retained = retained if not within_3km_excess_minor else (within_3km_primary + beyond_3km)
+    summary = _make_summary(base_retained)
+    if len(format_compact_json(summary)) <= 5450:
+        return summary
 
     priority_types = {"Gap", "Saddle", "Ridge", "Basin", "Cliff", "Pillar"}
     beyond_3km.sort(
@@ -3989,22 +3889,11 @@ def _build_nearby_stdout(full_features, filtered_features, out_json_path=None, v
     )
     prioritized = within_3km_primary + beyond_3km + within_3km_excess_minor
 
-    for compact_flag, ultra_flag, caps in (
-        (False, False, (40, 36)),
-        (True, False, (42, 38, 34)),
-        (True, True, (42, 38, 35, 34, 32, 28, 24)),
-    ):
-        for cap in caps:
-            sliced = sorted(prioritized[:cap], key=lambda x: x.get("distance_km", 0.0))
-            summary = _make_summary(
-                sliced,
-                strip_source=True,
-                round_coords=True,
-                compact_keys=compact_flag,
-                ultra_compact=ultra_flag,
-            )
-            if len(format_compact_json(summary)) <= 5450:
-                return summary
+    for cap in (38, 34, 30, 26, 22):
+        sliced = sorted(prioritized[:cap], key=lambda x: x.get("distance_km", 0.0))
+        summary = _make_summary(sliced)
+        if len(format_compact_json(summary)) <= 5450:
+            return summary
     return summary
 
 
@@ -4443,11 +4332,11 @@ def main():
             hp_all = res.get("dem_horizon_highpoints", [])
             fg_all = res.get("foreground_ridges", [])
             stdout_pano = None
-            for lvl, v_cap, hp_cap, fg_cap in (
-                (2, 12, 12, 4),
-                (3, 12, 12, 4),
-                (3, 10, 10, 3),
-                (4, 8, 8, 2),
+            for v_cap, hp_cap, fg_cap in (
+                (12, 12, 4),
+                (10, 10, 3),
+                (8, 8, 2),
+                (6, 6, 2),
             ):
                 cand_pano = {
                     "output_path": res.get("output_path"),
@@ -4459,9 +4348,9 @@ def main():
                     "visible_features_in_fov_count": len(vis_all),
                     "dem_horizon_highpoints_count": len(hp_all),
                     "foreground_ridges_count": len(fg_all),
-                    "visible_features_in_fov": [_compact_skyline_item(x, lvl) for x in vis_all[:v_cap]],
-                    "foreground_ridges": [_compact_skyline_item(x, lvl) for x in fg_all[:fg_cap]],
-                    "dem_horizon_highpoints": [_compact_skyline_item(x, lvl, is_hp=True) for x in hp_all[:hp_cap]],
+                    "visible_features_in_fov": [_compact_skyline_item(x, level=1) for x in vis_all[:v_cap]],
+                    "foreground_ridges": [_compact_skyline_item(x, level=1) for x in fg_all[:fg_cap]],
+                    "dem_horizon_highpoints": [_compact_skyline_item(x, level=1, is_hp=True) for x in hp_all[:hp_cap]],
                 }
                 if args.out_json:
                     cand_pano["out_json"] = os.path.abspath(args.out_json)
