@@ -9,10 +9,11 @@ Provides four subcommands:
      idempotently inserts or updates the matching entry in `<date>/catalog.md` in chronological
      photo order without loading `catalog.md` into the LLM context window.
 
-  2. `placements <date_dir>`:
+  2. `placements <date_dir> [--json] [--out-file <path>]`:
      Parses `<date_dir>/catalog.md` and outputs a compact one-line-per-photo summary of
-     `Location`, `Suggested Draft Placement`, and `Suggested Caption` for Phase 4 synthesis:
-     `[idx] <photo_name> | Location: <location> | Placement: <placement> | Caption: <caption>`
+     `Date & Time`, `Elevation`, `Location`, `Suggested Draft Placement`, and `Suggested Caption`
+     for Phase 4 synthesis:
+     `[idx] <photo_name> (<time_short>, <elev_short>) | Location: <location> | Placement: <placement> | Caption: <caption>`
 
   3. `status <date_dir>`:
      Reports lightweight cataloging progress (`cataloged_photos`, `last_cataloged_photo`,
@@ -63,8 +64,32 @@ TEMP_DEG_RE = re.compile(r"[-+]?\d+(?:\.\d+)?\s*°\s*[FCfc]\b")
 # optional "~", optional decimals ("300 ft / 91.4 m"), and "–", "-", "to", "and" range connectors
 SINGLE_FT_RE = re.compile(
     r"\b(\d{1,2},\d{3}|\d{3,5})\s*ft\b"
-    r"(?!\s*(?:[–-]|to|and)\s*~?\s*[\d,]+\s*ft\b)"
-    r"(?!\s*/\s*~?\s*[\d,]+(?:\.\d+)?(?:\s*(?:[–-]|to|and)\s*~?\s*[\d,]+(?:\.\d+)?)?\s*m\b)"
+    r"(?!\s*(?:[–-]|to|and)\s*~?\s*[+-]?\s*[\d,]+\s*ft\b)"
+    r"(?!\s*/\s*~?\s*[+-]?\s*[\d,]+(?:\.\d+)?(?:\s*(?:[–-]|to|and)\s*~?\s*[+-]?\s*[\d,]+(?:\.\d+)?)?\s*m\b)"
+)
+
+BACKTICK_MEASUREMENT_RE = re.compile(
+    r"`((?:Peak\s+)?[~<>+-]?\s*\d[\d,.]*(?:\s*(?:[–-]|to|and)\s*[~<>+-]?\s*\d[\d,.]*)*\s*(?:ft|m|mi|km|in|cm|miles|feet|meters|°F|°C)\b"
+    r"(?:\s*(?:/|to|and|[–-])\s*[~<>+-]?\s*\d[\d,.]*(?:\s*(?:[–-]|to|and)\s*[~<>+-]?\s*\d[\d,.]*)*\s*(?:ft|m|mi|km|in|cm|miles|feet|meters|°F|°C)\b)*)`"
+)
+
+LEAKED_IMAGE_COORD_RE = re.compile(
+    r"\b(?:projected_x_fraction|observed_x_fraction|x_fraction|expected_x_px|projected_x_px)\b"
+    r"|\b[xy]\s*[=≈]\s*[-+]?[01]\.\d+\b"
+)
+
+MULTI_ELEV_HEADER_RE = re.compile(
+    r"(?m)^\s*-\s+\*\*[^*\n]*\b\d[\d,]*(?:\.\d+)?\s*ft\s*/\s*~?\s*\d[\d,]*(?:\.\d+)?\s*m\b[^*\n]*\b\d[\d,]*(?:\.\d+)?\s*ft\s*/\s*~?\s*\d[\d,]*(?:\.\d+)?\s*m\b[^*\n]*\*\*\s*:"
+)
+
+CAPTION_TRAILING_PERIOD_DMS_RE = re.compile(
+    r"([^\s.])\s+(\(\d+\s*°\s*\d+\s*['’′]\s*[\d.]+\s*[\"”″]?\s*[NSns]\s+\d+\s*°\s*\d+\s*['’′]\s*[\d.]+\s*[\"”″]?\s*[EWew]\))\.(?=\s*$)",
+    re.MULTILINE,
+)
+
+CAPTION_DUP_PERIOD_DMS_RE = re.compile(
+    r"(\.\s+\(\d+\s*°\s*\d+\s*['’′]\s*[\d.]+\s*[\"”″]?\s*[NSns]\s+\d+\s*°\s*\d+\s*['’′]\s*[\d.]+\s*[\"”″]?\s*[EWew]\))\.(?=\s*$)",
+    re.MULTILINE,
 )
 
 
@@ -131,6 +156,15 @@ def normalize_entry_block(raw_text: str) -> Tuple[str, str]:
     body_after_header = cleaned[match.end():]
     normalized_header = f"### Photo: `{filename}`"
     full_entry = strip_outer_fences_and_dividers(normalized_header + body_after_header)
+
+    # Auto-normalize forbidden em-dashes, measurement backticks, malformed bold spacing,
+    # and trailing periods after DMS GPS coordinates at the end of Suggested Caption
+    full_entry = re.sub(r"[ \t]*—[ \t]*", " – ", full_entry)
+    full_entry = BACKTICK_MEASUREMENT_RE.sub(r"\1", full_entry)
+    full_entry = re.sub(r"(?<=\s)\*\*[ \t]+([^\n*]+?)\*\*", r"**\1**", full_entry)
+    full_entry = CAPTION_TRAILING_PERIOD_DMS_RE.sub(r"\1. \2", full_entry)
+    full_entry = CAPTION_DUP_PERIOD_DMS_RE.sub(r"\1", full_entry)
+
     return filename, full_entry
 
 
@@ -254,12 +288,27 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
                     "detail": f"Elevation in feet missing '/ YYY m' conversion near: '{snippet}'",
                 })
 
+        bt_meta = [m.group(0) for m in BACKTICK_MEASUREMENT_RE.finditer(meta_block)]
+        if bt_meta:
+            issues.append({
+                "source": f"catalog.md ({filename} -> Metadata)",
+                "type": "code_backtick_measurement",
+                "detail": f"Code backticks around measurement(s) are forbidden; use plain text: {bt_meta}",
+            })
+        coord_meta = [m.group(0) for m in LEAKED_IMAGE_COORD_RE.finditer(meta_block)]
+        if coord_meta:
+            issues.append({
+                "source": f"catalog.md ({filename} -> Metadata)",
+                "type": "leaked_image_coordinate",
+                "detail": f"Leaked internal image coordinate in Metadata: {coord_meta}",
+            })
+
     for part in parts[2:]:
         lines = part.splitlines()
         if not lines:
             continue
         sec_title = lines[0].strip()
-        sec_body = "\n".join(lines[1:]).strip()
+        sec_body = "\n".join(lines[1:]).strip("\r\n")
         sec_lower = sec_title.lower()
 
         is_draft_placement = "suggested draft placement" in sec_lower
@@ -268,6 +317,34 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
             or "identified fauna" in sec_lower
             or "suggested caption" in sec_lower
         )
+
+        bt_matches = [m.group(0) for m in BACKTICK_MEASUREMENT_RE.finditer(sec_body)]
+        if bt_matches:
+            issues.append({
+                "source": f"catalog.md ({filename} -> {sec_title})",
+                "type": "code_backtick_measurement",
+                "detail": f"Code backticks around measurement(s) are forbidden; use plain text: {bt_matches}",
+            })
+
+        coord_matches = [m.group(0) for m in LEAKED_IMAGE_COORD_RE.finditer(sec_body)]
+        if coord_matches:
+            issues.append({
+                "source": f"catalog.md ({filename} -> {sec_title})",
+                "type": "leaked_image_coordinate",
+                "detail": f"Leaked internal image coordinate in '{sec_title}': {coord_matches}",
+            })
+
+        if "identified natural features" in sec_lower:
+            multi_elev_matches = [m.group(0).strip() for m in MULTI_ELEV_HEADER_RE.finditer(sec_body)]
+            if multi_elev_matches:
+                issues.append({
+                    "source": f"catalog.md ({filename} -> {sec_title})",
+                    "type": "multiple_elevations_in_feature_header",
+                    "detail": (
+                        "Bold feature header contains multiple dual-unit elevations "
+                        f"(keep only one elevation in the bold header and move secondary benchmarks into prose): {multi_elev_matches}"
+                    ),
+                })
 
         if is_checked_section:
             for m_ft in SINGLE_FT_RE.finditer(sec_body):
@@ -305,18 +382,25 @@ def inspect_entry_formatting(filename: str, entry_text: str, raw_header_line: Op
     return issues
 
 
+validate_entry_block = inspect_entry_formatting
+
 _NEGATED_DISCREPANCY_RE = re.compile(
-    r"\b(?:no|zero|without)\s+(?:[\w&-]+\s+){0,6}discrepanc\w*|\bconsistent\s+with\b",
+    r"\b(?:no|zero|without|none)\b[^.!?\n]{0,85}?\bdiscrepanc\w*|\bconsistent\s+with\b|\bmatch(?:es)?\b[^.!?\n]{0,50}?\bwithout\s+discrepanc\w*",
     re.IGNORECASE,
 )
 _DISCREPANCY_SIGNAL_RE = re.compile(
-    r"\b(?:discrepanc\w*|reconcil\w*|mismatch\w*|inaccura\w*|erroneous\w*|incorrect\w*|off\s+by\s+>?\s*\d+)\b",
+    r"\b(?:discrepanc\w*|reconcil\w*|mismatch\w*|inaccura\w*|erroneous\w*|incorrect\w*|off\s+by\s+>?\s*[\d,]+|"
+    r"should\s+be\s+corrected|exceed(?:s|ing)?\s+the\s+[<>]?\s*[\d,]+\s*ft|"
+    r"(?:higher|lower)\s+than\s+the\s+(?:official|authoritative|USGS|3DEP)|hallucinat\w*|wrong\b|error\b)\b",
     re.IGNORECASE,
 )
 _NOTE_BLOCK_START_RE = re.compile(
     r"^\s*(?:[-*]\s+)?(?:\*+)?(?:"
     r"Geometric|Chronological|Placement\s+Rationale|Context\s*(?:&\s*Placement)?\s*Rationale|"
-    r"Placement\s*&\s*Geometric|Draft\s+Alignment|"
+    r"Placement\s*&\s*Geometric|Draft\s+Alignment|Draft\s+Cross-Check|"
+    r"Narrative\s*&\s*Geometric|Geometric\s*&\s*Narrative|Geometric\s*&\s*Landmark|"
+    r"Why\s+It\s+Fits|Context\s*&|Chronological\s*&|"
+    r"Alternative\s+Placement|Option\s+2|Secondary\s+Option|"
     r"Out-of-Frame|Line-of-Sight|Narrative\s+Cross-Check|Elevation\s+Verification|"
     r"Verification\s+Note|Note\s+for\s+`?post\.md`?\s+context"
     r")[^:\n]*?(?:\*+)?\s*:",
@@ -325,7 +409,10 @@ _NOTE_BLOCK_START_RE = re.compile(
 _INLINE_NOTE_TAIL_RE = re.compile(
     r"(?:\s+[-*]\s+\*\*|\s+\*\*)(?:"
     r"Geometric|Chronological|Placement\s+Rationale|Context\s*(?:&\s*Placement)?\s*Rationale|"
-    r"Placement\s*&\s*Geometric|Draft\s+Alignment|"
+    r"Placement\s*&\s*Geometric|Draft\s+Alignment|Draft\s+Cross-Check|"
+    r"Narrative\s*&\s*Geometric|Geometric\s*&\s*Narrative|Geometric\s*&\s*Landmark|"
+    r"Why\s+It\s+Fits|Context\s*&|Chronological\s*&|"
+    r"Alternative\s+Placement|Option\s+2|Secondary\s+Option|"
     r"Out-of-Frame|Line-of-Sight|Narrative\s+Cross-Check|Elevation\s+Verification"
     r")[^:*]*?\*\*\s*:.*$",
     re.IGNORECASE,
@@ -348,15 +435,26 @@ _NO_DISCREPANCY_SENTENCE_RE = re.compile(
 
 
 def _has_discrepancy_flag(text: str) -> bool:
-    scrubbed = _NEGATED_DISCREPANCY_RE.sub(" ", text)
+    body = re.sub(r"^\s*(?:[-*]\s+)?\*\*[^*]+?\*\*\s*:\s*", "", text)
+    scrubbed = _NEGATED_DISCREPANCY_RE.sub(" ", body)
     return bool(_DISCREPANCY_SIGNAL_RE.search(scrubbed))
+
+
+def _strip_note_label_prefix(text: str) -> str:
+    return re.sub(
+        r"^\s*(?:[-*]\s+)?(?:\*\*[^*]+?\*\*|[A-Za-z0-9\s&/`.-]+Note)\s*:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
 
 
 def _compact_placement_summary(sec_lines: List[str]) -> str:
     """
     Strips verbose non-discrepancy `- **Geometric & Chronological Note**:` bullets
     and redundant post-quote commentary from `Suggested Draft Placement` while
-    preserving the placement target/quote and any Discrepancy / Reconciliation flag.
+    preserving the placement target/quote (`<= 220 chars`) separately from any true
+    Discrepancy / Reconciliation flag (`[DISCREPANCY: ...]` `<= 180 chars`).
     """
     blocks: List[Tuple[bool, List[str]]] = []
     for raw_line in sec_lines:
@@ -366,6 +464,11 @@ def _compact_placement_summary(sec_lines: List[str]) -> str:
         is_subbullet = bool(re.match(r"^\s{2,}[-*]\s+", raw_line))
         is_note_start = bool(
             _NOTE_BLOCK_START_RE.match(stripped)
+            or re.match(
+                r"^\s*(?:[-*]\s+)?\*\*[^*]*?(?:Discrepancy|Reconciliation)[^*]*?\*\*\s*:",
+                stripped,
+                re.IGNORECASE,
+            )
             or re.match(
                 r"^\*?\((?:Geometric\s+note|Note\s*:|Elevation\s+note|Note\s+for\s+draft)",
                 stripped,
@@ -384,65 +487,94 @@ def _compact_placement_summary(sec_lines: List[str]) -> str:
         else:
             blocks[-1][1].append(stripped)
 
-    kept_parts: List[str] = []
+    target_parts: List[str] = []
+    disc_parts: List[str] = []
+
     for is_note, blk_lines in blocks:
         blk_text = re.sub(r"\s+", " ", " ".join(blk_lines)).strip()
-        if is_note and not _has_discrepancy_flag(blk_text):
+        blk_text = _NO_DISCREPANCY_SENTENCE_RE.sub(" ", blk_text).strip()
+        if not blk_text:
             continue
-        kept_parts.append(blk_text)
+        if is_note:
+            if _has_discrepancy_flag(blk_text):
+                disc_parts.append(_strip_note_label_prefix(blk_text))
+            continue
 
-    placement = re.sub(r"\s+", " ", " ".join(kept_parts)).strip()
-    if not placement:
-        placement = re.sub(r"\s+", " ", "\n".join(sec_lines)).strip()
+        # Check inline note tails on non-note blocks
+        for tail_re in (_INLINE_NOTE_TAIL_RE, _UNBOLDED_NOTE_TAIL_RE):
+            m_tail = tail_re.search(blk_text)
+            if m_tail:
+                tail_str = m_tail.group(0).strip()
+                if _has_discrepancy_flag(tail_str):
+                    disc_parts.append(_strip_note_label_prefix(tail_str))
+                blk_text = blk_text[: m_tail.start()].strip()
 
-    placement = _NO_DISCREPANCY_SENTENCE_RE.sub(" ", placement).strip()
+        for m_paren in list(_PAREN_NOTE_RE.finditer(blk_text)):
+            paren_str = m_paren.group(0).strip()
+            if _has_discrepancy_flag(paren_str):
+                disc_parts.append(_strip_note_label_prefix(paren_str.strip("*() ")))
+            blk_text = (blk_text[: m_paren.start()] + " " + blk_text[m_paren.end() :]).strip()
 
-    for tail_re in (_INLINE_NOTE_TAIL_RE, _UNBOLDED_NOTE_TAIL_RE):
-        m_tail = tail_re.search(placement)
-        if m_tail and not _has_discrepancy_flag(m_tail.group(0)):
-            placement = placement[: m_tail.start()].strip()
+        # Strip trailing commentary sentences after the verbatim quote
+        m_post_quote = re.search(
+            r'([*"”\'`\)]\.?\s+)((?:Taken|Captured)\s+(?:at\s+`?\d|~`?\d|directly\s+on\b).*|'
+            r'This\s+photo\s+(?:was\s+captured|directly\s+(?:illustrates|captures)|illustrates|captures)\b.*|'
+            r'Note\s+that\s+\*\*.*)$',
+            blk_text,
+        )
+        if m_post_quote:
+            post_q_tail = m_post_quote.group(2).strip()
+            if _has_discrepancy_flag(post_q_tail):
+                disc_parts.append(_strip_note_label_prefix(post_q_tail))
+            blk_text = blk_text[: m_post_quote.start(2)].strip()
 
-    for m_paren in list(_PAREN_NOTE_RE.finditer(placement)):
-        if not _has_discrepancy_flag(m_paren.group(0)):
-            placement = (placement[: m_paren.start()] + " " + placement[m_paren.end() :]).strip()
+        if blk_text:
+            target_parts.append(blk_text)
 
-    # Strip trailing non-discrepancy commentary sentences after the verbatim quote
-    m_post_quote = re.search(
-        r'([*"”\'`\)]\.?\s+)((?:Taken|Captured)\s+(?:at\s+`?\d|~`?\d|directly\s+on\b).*|'
-        r'This\s+photo\s+(?:was\s+captured|directly\s+(?:illustrates|captures)|illustrates|captures)\b.*|'
-        r'Note\s+that\s+\*\*.*)$',
-        placement,
-    )
-    if m_post_quote and not _has_discrepancy_flag(m_post_quote.group(2)):
-        placement = placement[: m_post_quote.start(2)].strip()
+    non_note_text = re.sub(r"\s+", " ", " ".join(target_parts)).strip()
+    if not non_note_text:
+        non_note_text = re.sub(r"\s+", " ", "\n".join(sec_lines)).strip()
+        non_note_text = _NO_DISCREPANCY_SENTENCE_RE.sub(" ", non_note_text).strip()
 
-    # Compact overly long verbatim post.md quotes (> 160 chars) to first 75 + ... + last 65 chars
+    # Compact verbatim post.md quotes (> 90 chars) to first 45 + ... + last 35 chars
     def _shorten_quote(m: re.Match) -> str:
         open_q, body, close_q = m.group(1), m.group(2), m.group(3)
-        if len(body) <= 160 or _has_discrepancy_flag(body):
+        if len(body) <= 90 or _has_discrepancy_flag(body):
             return m.group(0)
-        return f"{open_q}{body[:75].rstrip()} ... {body[-65:].lstrip()}{close_q}"
+        return f"{open_q}{body[:45].rstrip()} ... {body[-35:].lstrip()}{close_q}"
 
-    placement = re.sub(
-        r'(\*"|`"|“|")(.{161,}?)("\*|"`|”|")',
+    non_note_text = re.sub(
+        r'(\*"|`"|“|")(.{91,}?)("\*|"`|”|")',
         _shorten_quote,
-        placement,
+        non_note_text,
     )
-    placement = re.sub(
+    non_note_text = re.sub(
         r"^\s*[-*]\s*\*\*(?:Placement|Target\s+Section)\*\*\s*:\s*",
         "",
-        placement,
+        non_note_text,
         flags=re.IGNORECASE,
     )
+    non_note_text = re.sub(r"\s+", " ", non_note_text).strip()
 
-    return re.sub(r"\s+", " ", placement).strip()
+    if len(non_note_text) > 220:
+        non_note_text = non_note_text[:217].rstrip() + "..."
+
+    if disc_parts:
+        disc_str = re.sub(r"\s+", " ", "; ".join(disc_parts)).strip()
+        if len(disc_str) > 180:
+            disc_str = disc_str[:177].rstrip() + "..."
+        return f"{non_note_text} [DISCREPANCY: {disc_str}]".strip()
+
+    return non_note_text
 
 
 def extract_entry_summary_fields(entry_text: str) -> Dict[str, str]:
     """
-    Extracts single-line `location`, `placement`, and `caption` fields from a
-    normalized catalog entry block for Phase 4 synthesis (`placements`).
+    Extracts single-line `time_short`, `elev_short`, `location`, `placement`,
+    and `caption` fields from a normalized catalog entry block for Phase 4 synthesis (`placements`).
     """
+    time_short = ""
+    elev_short = ""
     location = ""
     placement = ""
     caption = ""
@@ -450,6 +582,28 @@ def extract_entry_summary_fields(entry_text: str) -> Dict[str, str]:
     parts = re.split(r"(?m)^###\s+", entry_text)
     if len(parts) >= 2:
         meta_block = parts[1]
+        m_time = re.search(
+            r"(?m)^\s*-\s*\*\*Date\s*&\s*Time(?:\s+Taken)?\*\*\s*:\s*(.+)$",
+            meta_block,
+        )
+        if m_time:
+            raw_dt = m_time.group(1).strip()
+            m_hms = re.search(r"\b(\d{1,2}:\d{2}(?::\d{2})?)\b", raw_dt)
+            time_short = m_hms.group(1) if m_hms else raw_dt
+
+        m_elev = re.search(r"(?m)^\s*-\s*\*\*Elevation\*\*\s*:\s*(.+)$", meta_block)
+        if m_elev:
+            raw_el = m_elev.group(1).strip()
+            m_dual = re.search(
+                r"(~?\s*[\d,]+(?:\.\d+)?\s*ft\s*/\s*~?\s*[\d,]+(?:\.\d+)?\s*m)\b",
+                raw_el,
+            )
+            elev_short = (
+                re.sub(r"\s+", " ", m_dual.group(1)).strip()
+                if m_dual
+                else re.sub(r"\s+", " ", raw_el).strip()
+            )
+
         m_loc = re.search(r"(?m)^\s*-\s*\*\*Location\*\*\s*:\s*(.+)$", meta_block)
         if m_loc:
             location = re.sub(r"\s+", " ", m_loc.group(1)).strip()
@@ -465,6 +619,8 @@ def extract_entry_summary_fields(entry_text: str) -> Dict[str, str]:
             caption = re.sub(r"\s+", " ", "\n".join(lines[1:])).strip()
 
     return {
+        "time_short": time_short,
+        "elev_short": elev_short,
         "location": location,
         "placement": placement,
         "caption": caption,
@@ -558,6 +714,48 @@ def cmd_upsert(args: argparse.Namespace) -> None:
     print(json.dumps(result, ensure_ascii=False))
 
 
+def _compact_location_for_stdout(loc: str, max_len: int = 45) -> str:
+    short = re.split(
+        r",\s*(?:Pacific\s+Crest\s+Trail|John\s+Muir\s+Trail|Sequoia-Kings|Kings\s+Canyon|Inyo\s+National|John\s+Muir\s+Wilderness|Fresno\s+County|Inyo\s+County)",
+        loc,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    if len(short) > max_len:
+        short = short[: max_len - 3].rstrip() + "..."
+    return short
+
+
+def _compact_placement_for_stdout(place: str, max_target_len: int = 115) -> str:
+    disc_marker = " [DISCREPANCY: "
+    if disc_marker in place:
+        target_part, disc_part = place.split(disc_marker, 1)
+        disc_suffix = disc_marker + disc_part
+    else:
+        target_part = place
+        disc_suffix = ""
+    target_part = re.sub(
+        r"^\s*(?:[-*]\s*)?\*\*(?:Recommended|Primary)\s+(?:Section|Placement)[^*]*\*\*\s*:\s*",
+        "",
+        target_part,
+        flags=re.IGNORECASE,
+    ).strip()
+    if len(target_part) > max_target_len:
+        target_part = target_part[: max_target_len - 3].rstrip() + "..."
+    return f"{target_part}{disc_suffix}".strip()
+
+
+def _compact_caption_for_stdout(cap: str, max_body_len: int = 42) -> str:
+    m_dms = re.search(r"(\(\d+\s*°[^()]+\))\s*\.?\s*$", cap)
+    dms_str = m_dms.group(1) if m_dms else ""
+    body = cap[: m_dms.start()].strip() if m_dms else cap.strip()
+    if max_body_len <= 0:
+        return dms_str
+    if len(body) > max_body_len:
+        body = body[: max_body_len - 3].rstrip() + "..."
+    return f"{body} {dms_str}".strip() if dms_str else body
+
+
 def cmd_placements(args: argparse.Namespace) -> None:
     _, catalog_path = _resolve_date_dir_and_catalog(args.date_dir)
     if not catalog_path.exists():
@@ -572,27 +770,62 @@ def cmd_placements(args: argparse.Namespace) -> None:
 
     _, parsed_entries = parse_catalog_file(catalog_path)
     items: List[Dict[str, Any]] = []
-    lines_out: List[str] = []
+    full_lines_out: List[str] = []
     for idx, (fn, norm_text, _) in enumerate(parsed_entries, 1):
         fields = extract_entry_summary_fields(norm_text)
+        time_short = fields["time_short"]
+        elev_short = fields["elev_short"]
         loc = fields["location"]
         place = fields["placement"]
         cap = fields["caption"]
         items.append({
             "index": idx,
             "photo": fn,
+            "time": time_short,
+            "elevation": elev_short,
             "location": loc,
             "placement": place,
             "caption": cap,
         })
-        lines_out.append(
-            f"[{idx}] {fn} | Location: {loc} | Placement: {place} | Caption: {cap}"
+        meta_parts = [p for p in (time_short, elev_short) if p]
+        meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
+        full_lines_out.append(
+            f"[{idx}] {fn}{meta_str} | Location: {loc} | Placement: {place} | Caption: {cap}"
         )
 
-    if getattr(args, "json", False):
-        print(json.dumps(items, ensure_ascii=False, indent=2))
-    else:
-        print("\n".join(lines_out))
+    full_output_str = (
+        json.dumps(items, ensure_ascii=False, indent=2)
+        if getattr(args, "json", False)
+        else "\n".join(full_lines_out)
+    )
+    if getattr(args, "out_file", None):
+        out_path = Path(args.out_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(full_output_str + "\n", encoding="utf-8", newline="\n")
+
+    stdout_str = full_output_str
+    if not getattr(args, "json", False) and not getattr(args, "full", False):
+        if len(stdout_str.encode("utf-8")) > 7400:
+            for loc_cap, pl_cap, cap_body_cap in (
+                (45, 115, 42),
+                (38, 95, 25),
+                (32, 80, 0),
+            ):
+                compact_lines: List[str] = []
+                for it in items:
+                    meta_parts = [p for p in (it["time"], it["elevation"]) if p]
+                    meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
+                    loc_s = _compact_location_for_stdout(it["location"], loc_cap)
+                    pl_s = _compact_placement_for_stdout(it["placement"], pl_cap)
+                    cap_s = _compact_caption_for_stdout(it["caption"], cap_body_cap)
+                    compact_lines.append(
+                        f"[{it['index']}] {it['photo']}{meta_str} | Location: {loc_s} | Placement: {pl_s} | Caption: {cap_s}"
+                    )
+                stdout_str = "\n".join(compact_lines)
+                if len(stdout_str.encode("utf-8")) <= 7400:
+                    break
+
+    print(stdout_str)
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -679,7 +912,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
     if post_path.exists():
         post_text = post_path.read_text(encoding="utf-8", errors="replace")
 
-        # Check for forbidden em-dashes in post.md
+        # Check for forbidden em-dashes, backticked measurements, and leaked image coordinates in post.md
         for line_num, line in enumerate(post_text.splitlines(), 1):
             if "—" in line:
                 snippets = [s.strip() for s in re.findall(r".{0,25}—.{0,25}", line)]
@@ -687,6 +920,20 @@ def cmd_validate(args: argparse.Namespace) -> None:
                     "source": f"post.md (line {line_num})",
                     "type": "forbidden_em_dash",
                     "detail": f"Contains forbidden em-dash ('—'); use ' – ' instead: {snippets}",
+                })
+            bt_line_matches = [m.group(0) for m in BACKTICK_MEASUREMENT_RE.finditer(line)]
+            if bt_line_matches:
+                formatting_issues.append({
+                    "source": f"post.md (line {line_num})",
+                    "type": "code_backtick_measurement",
+                    "detail": f"Code backticks around measurement(s) are forbidden; use plain text: {bt_line_matches}",
+                })
+            coord_line_matches = [m.group(0) for m in LEAKED_IMAGE_COORD_RE.finditer(line)]
+            if coord_line_matches:
+                formatting_issues.append({
+                    "source": f"post.md (line {line_num})",
+                    "type": "leaked_image_coordinate",
+                    "detail": f"Leaked internal image coordinate in post.md: {coord_line_matches}",
                 })
 
         # Match [PHOTO: <filename>][CAPTION: <caption>]
@@ -755,6 +1002,17 @@ def cmd_validate(args: argparse.Namespace) -> None:
     duplicate_post_placements = [fn for fn, cnt in placed_counts.items() if cnt > 1]
     placed_set = set(placed_photo_occurrences)
 
+    out_of_order_post_placements: List[Dict[str, str]] = []
+    for idx in range(1, len(placed_photo_occurrences)):
+        prev_fn = placed_photo_occurrences[idx - 1]
+        curr_fn = placed_photo_occurrences[idx]
+        if natural_photo_key(curr_fn) < natural_photo_key(prev_fn):
+            out_of_order_post_placements.append({
+                "previous_photo": prev_fn,
+                "out_of_order_photo": curr_fn,
+                "detail": f"'{curr_fn}' is placed after '{prev_fn}' in post.md, violating chronological photo sequence.",
+            })
+
     all_expected_photos = sorted(
         set(folder_photos) | cataloged_set,
         key=natural_photo_key,
@@ -767,6 +1025,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
         and len(unplaced_photos) == 0
         and len(duplicate_catalog_entries) == 0
         and len(duplicate_post_placements) == 0
+        and len(out_of_order_post_placements) == 0
         and len(formatting_issues) == 0
     )
 
@@ -780,6 +1039,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
         "unplaced_photos": unplaced_photos,
         "duplicate_catalog_entries": duplicate_catalog_entries,
         "duplicate_post_placements": duplicate_post_placements,
+        "out_of_order_post_placements": out_of_order_post_placements,
         "formatting_issues": formatting_issues,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -804,6 +1064,8 @@ def main() -> None:
     )
     p_place.add_argument("date_dir", help="Path to <date> directory (or <date>/catalog.md)")
     p_place.add_argument("--json", action="store_true", help="Output structured JSON instead of compact lines")
+    p_place.add_argument("--full", action="store_true", help="Output uncompacted Location, Placement, and Caption on stdout")
+    p_place.add_argument("--out-file", default=None, help="Optional file path to also save the full placements summary to disk")
 
     p_status = subparsers.add_parser(
         "status",

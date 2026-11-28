@@ -47,7 +47,6 @@ def calculate_haversine(lat1, lon1, lat2, lon2):
     cardinals = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
     cardinal = cardinals[int((bearing + 11.25) / 22.5) % 16]
     return {
-        "distance_ft": round(dist_m * 3.28084, 1),
         "distance_m": round(dist_m, 1),
         "distance_mi": round(dist_m / 1609.344, 2),
         "distance_km": round(dist_m / 1000.0, 2),
@@ -738,9 +737,9 @@ def format_camera_spec(camera_model, lens_model, focal_mm, focal_35mm, hfov_deg,
 def format_compact_json(data, indent_level=0):
     """
     Formats a Python dict/list as 100% valid JSON while keeping list-of-dict arrays
-    (elevation_deltas, prev_hike_stops, next_hike_stops) and nested dictionaries
-    (prev_photo, next_photo, admin_boundaries) to 1 compact single-line JSON object
-    per element so stdout remains compact (~2.5-4.3 KB) even with 25+ --ref-elev-ft flags.
+    (prev_hike_stops, next_hike_stops) and nested dictionaries (elevation_deltas,
+    prev_photo, next_photo, admin_boundaries) to 1 compact single-line JSON object
+    per element so stdout remains compact (~2.2-3.0 KB) even with 25+ --ref-elev-ft flags.
     """
     pad = " " * indent_level
     next_pad = " " * (indent_level + 1)
@@ -957,7 +956,7 @@ def main():
 
     elevation_str = f"{chosen_ft:,} ft / {chosen_m:,} m" if chosen_ft is not None else "[Not available]"
 
-    elevation_deltas = []
+    elevation_deltas = {}
     if chosen_ft is not None and args.ref_elev_ft:
         for ref_item in args.ref_elev_ft:
             label = "reference"
@@ -969,9 +968,7 @@ def main():
                 diff_ft = round(chosen_ft - ref_ft)
                 diff_m = round(diff_ft * 0.3048)
                 direction = "above" if diff_ft >= 0 else "below"
-                elevation_deltas.append({
-                    f"{label} ({round(ref_ft):,} ft)": f"~{abs(diff_ft):,} ft / {abs(diff_m):,} m {direction}"
-                })
+                elevation_deltas[f"{label} ({round(ref_ft):,} ft)"] = f"~{abs(diff_ft):,} ft / {abs(diff_m):,} m {direction}"
             except ValueError:
                 pass
 
@@ -1026,7 +1023,47 @@ def main():
     if elevation_deltas:
         result["elevation_deltas"] = elevation_deltas
 
-    print(format_compact_json(result))
+    out_str = format_compact_json(result)
+    if len(out_str.encode("utf-8")) > 3450:
+        prev_fn = prev_photo.get("filename") if isinstance(prev_photo, dict) else None
+        next_fn = next_photo.get("filename") if isinstance(next_photo, dict) else None
+        result["prev_hike_stops"] = [
+            {k: v for k, v in s.items() if k not in ("lat", "lon")}
+            for s in (prev_hike_stops or [])
+            if s.get("file") != prev_fn
+        ][:2]
+        result["next_hike_stops"] = [
+            {k: v for k, v in s.items() if k not in ("lat", "lon")}
+            for s in (next_hike_stops or [])
+            if s.get("file") != next_fn
+        ][:2]
+        out_str = format_compact_json(result)
+
+    if len(out_str.encode("utf-8")) > 3450:
+        result["prev_hike_stops"] = [
+            {k: v for k, v in s.items() if k not in ("lat", "lon", "bearing_deg")}
+            for s in result.get("prev_hike_stops", [])[:1]
+        ]
+        result["next_hike_stops"] = [
+            {k: v for k, v in s.items() if k not in ("lat", "lon", "bearing_deg")}
+            for s in result.get("next_hike_stops", [])[:1]
+        ]
+        if isinstance(result.get("admin_boundaries"), dict):
+            ab = dict(result["admin_boundaries"])
+            if ab.get("national_park") or ab.get("wilderness") or ab.get("national_forest"):
+                ab.pop("federal_lands", None)
+            result["admin_boundaries"] = ab
+        out_str = format_compact_json(result)
+
+    if len(out_str.encode("utf-8")) > 3450:
+        if result.get("panorama_guidance") is None:
+            result.pop("panorama_guidance", None)
+        if result.get("ground_elevation_ft") is not None:
+            result.pop("exif_elevation_ft", None)
+            result.pop("exif_elevation_m", None)
+        out_str = format_compact_json(result)
+
+    print(out_str)
 
 
 if __name__ == "__main__":
